@@ -7,14 +7,10 @@ package flash.display {
     import flash.media.SoundTransform;
     import flash.display.DisplayObject;
     import flash.display.InteractiveObject;
+    import flash.text.TextSnapshot;
 
-    [Ruffle(NativeInstanceInit)]
+    [Ruffle(Abstract)]
     public class DisplayObjectContainer extends InteractiveObject {
-
-        public function DisplayObjectContainer() {
-            throw new Error("You cannot construct DisplayObjectContainer directly.");
-        }
-
         public native function get numChildren():int;
         public native function get mouseChildren():Boolean;
         public native function set mouseChildren(value:Boolean):void;
@@ -42,5 +38,10 @@ package flash.display {
 
         public native function getObjectsUnderPoint(point:Point):Array;
         public native function areInaccessibleObjectsUnderPoint(point:Point):Boolean;
+
+        public function get textSnapshot():TextSnapshot {
+            stub_getter("flash.display.DisplayObjectContainer", "textSnapshot")
+            return new TextSnapshot();
+        }
     }
 }

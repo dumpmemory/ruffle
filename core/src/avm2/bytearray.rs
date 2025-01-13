@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::cmp;
 use std::fmt::{self, Display, Formatter};
 use std::io::prelude::*;
-use std::io::{self, Read, SeekFrom};
+use std::io::{self, SeekFrom};
 
 #[derive(Clone, Collect, Debug, Copy, PartialEq, Eq)]
 #[collect(no_drop)]
@@ -83,8 +83,7 @@ pub enum ObjectEncoding {
     Amf3 = 3,
 }
 
-#[derive(Clone, Collect, Debug)]
-#[collect(no_drop)]
+#[derive(Clone, Debug)]
 pub struct ByteArrayStorage {
     /// Underlying ByteArray
     bytes: Vec<u8>,
@@ -230,11 +229,13 @@ impl ByteArrayStorage {
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
-                let mut encoder = ZlibEncoder::new(&*self.bytes, Compression::fast());
+                // Note: some content is sensitive to compression type
+                // (as it's visible in the header)
+                let mut encoder = ZlibEncoder::new(&*self.bytes, Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             CompressionAlgorithm::Deflate => {
-                let mut encoder = DeflateEncoder::new(&*self.bytes, Compression::fast());
+                let mut encoder = DeflateEncoder::new(&*self.bytes, Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             #[cfg(feature = "lzma")]
@@ -330,6 +331,11 @@ impl ByteArrayStorage {
         }
 
         *self.bytes.get_mut(item).unwrap() = value;
+    }
+
+    /// Write a single byte at any offset in the bytearray, panicking if out of bounds.
+    pub fn set_nongrowing(&mut self, item: usize, value: u8) {
+        self.bytes[item] = value;
     }
 
     pub fn delete(&mut self, item: usize) {

@@ -4,7 +4,7 @@ use crate::image_trigger::ImageTrigger;
 use crate::util::write_image;
 use anyhow::{anyhow, Result};
 use approx::relative_eq;
-use image::ImageOutputFormat;
+use image::ImageFormat;
 use regex::Regex;
 use ruffle_core::tag_utils::SwfMovie;
 use ruffle_core::{PlayerBuilder, PlayerRuntime, ViewportDimensions};
@@ -174,10 +174,30 @@ impl PlayerOptions {
 
         player_builder = player_builder.with_player_runtime(self.runtime);
 
-        #[cfg(feature = "ruffle_video_software")]
         if self.with_video {
-            use ruffle_video_software::backend::SoftwareVideoBackend;
-            player_builder = player_builder.with_video(SoftwareVideoBackend::new())
+            #[cfg(feature = "ruffle_video_external")]
+            {
+                let current_exe = std::env::current_exe()?;
+                let directory = current_exe.parent().expect("Executable parent dir");
+
+                use ruffle_video_external::{
+                    backend::ExternalVideoBackend, decoder::openh264::OpenH264Codec,
+                };
+                let openh264 = OpenH264Codec::load(directory)
+                    .map_err(|e| anyhow!("Couldn't load OpenH264: {}", e))?;
+
+                player_builder =
+                    player_builder.with_video(ExternalVideoBackend::new_with_openh264(openh264));
+            }
+
+            #[cfg(all(
+                not(feature = "ruffle_video_external"),
+                feature = "ruffle_video_software"
+            ))]
+            {
+                player_builder = player_builder
+                    .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new());
+            }
         }
 
         Ok(player_builder)
@@ -246,7 +266,7 @@ impl ImageComparison {
                 write_image(
                     &test_path.join(format!("{name}.actual-{environment_name}.png"))?,
                     &actual_image,
-                    ImageOutputFormat::Png,
+                    ImageFormat::Png,
                 )
             } else {
                 Ok(())
@@ -324,7 +344,7 @@ impl ImageComparison {
                 write_image(
                     &test_path.join(format!("{name}.difference-color-{environment_name}.png"))?,
                     &difference_image,
-                    ImageOutputFormat::Png,
+                    ImageFormat::Png,
                 )?;
             }
 
@@ -348,7 +368,7 @@ impl ImageComparison {
                         &test_path
                             .join(format!("{name}.difference-alpha-{environment_name}.png"))?,
                         &difference_image,
-                        ImageOutputFormat::Png,
+                        ImageFormat::Png,
                     )?;
                 }
             }
@@ -373,7 +393,6 @@ impl ImageComparison {
 pub struct RenderOptions {
     optional: bool,
     pub sample_count: u32,
-    pub exclude_warp: bool,
 }
 
 impl Default for RenderOptions {
@@ -381,7 +400,6 @@ impl Default for RenderOptions {
         Self {
             optional: false,
             sample_count: 1,
-            exclude_warp: false,
         }
     }
 }

@@ -9,7 +9,6 @@ use ruffle_render::shape_utils::{DrawCommand, FillRule};
 use ruffle_render::transform::Transform;
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
-use std::cmp::max;
 use std::hash::{Hash, Hasher};
 use swf::FillStyle;
 
@@ -36,23 +35,8 @@ pub enum DefaultFont {
     JapaneseMincho,
 }
 
-/// Certain Flash routines measure text by rounding down to the nearest whole pixel.
-pub fn round_down_to_pixel(t: Twips) -> Twips {
-    Twips::from_pixels(t.to_pixels().floor())
-}
-
-pub fn round_to_pixel(t: Twips) -> Twips {
+fn round_to_pixel(t: Twips) -> Twips {
     Twips::from_pixels(t.to_pixels().round())
-}
-
-pub fn round_to_pixel_half_even(t: Twips) -> Twips {
-    let mod2 = t.to_pixels() % 2.0;
-    let mod2 = if mod2 < 0.0 { mod2 + 2.0 } else { mod2 };
-    if mod2 <= 0.5 || (mod2 >= 1.0 && mod2 < 1.5) {
-        Twips::from_pixels(t.to_pixels().floor())
-    } else {
-        Twips::from_pixels(t.to_pixels().ceil())
-    }
 }
 
 /// Parameters necessary to evaluate a font.
@@ -65,7 +49,7 @@ pub struct EvalParameters {
     /// after normal or kerned glyph advances are applied.
     letter_spacing: Twips,
 
-    /// Whether or not to allow use of font-provided kerning metrics.
+    /// Whether to allow use of font-provided kerning metrics.
     ///
     /// Fonts can optionally add or remove additional spacing between specific
     /// pairs of letters, separate from the ordinary width between glyphs. This
@@ -105,7 +89,7 @@ struct GlyphToDrawing<'a>(&'a mut Drawing);
 /// Convert from a TTF outline, to a flash Drawing.
 ///
 /// Note that the Y axis is flipped. I do not know why, but Flash does this.
-impl<'a> ttf_parser::OutlineBuilder for GlyphToDrawing<'a> {
+impl ttf_parser::OutlineBuilder for GlyphToDrawing<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
         self.0.draw_command(DrawCommand::MoveTo(Point::new(
             Twips::new(x as i32),
@@ -207,8 +191,11 @@ impl FontFace {
             return self.glyphs[glyph_id.0 as usize]
                 .get_or_init(|| {
                     let mut drawing = Drawing::new();
-                    drawing.set_winding_rule(FillRule::NonZero); // TTF uses NonZero
-                    drawing.set_fill_style(Some(FillStyle::Color(Color::WHITE)));
+                    // TTF uses NonZero
+                    drawing.new_fill(
+                        Some(FillStyle::Color(Color::WHITE)),
+                        Some(FillRule::NonZero),
+                    );
                     if face
                         .outline_glyph(glyph_id, &mut GlyphToDrawing(&mut drawing))
                         .is_some()
@@ -221,6 +208,7 @@ impl FontFace {
                             shape_handle: Default::default(),
                             shape: GlyphShape::Drawing(drawing),
                             advance,
+                            character,
                         })
                     } else {
                         let advance = Twips::new(face.glyph_hor_advance(glyph_id)? as i32);
@@ -229,6 +217,7 @@ impl FontFace {
                             shape_handle: Default::default(),
                             shape: GlyphShape::None,
                             advance,
+                            character,
                         })
                     }
                 })
@@ -422,12 +411,16 @@ impl<'gc> Font<'gc> {
             .enumerate()
             .map(|(index, swf_glyph)| {
                 let code = swf_glyph.code;
+                // TODO: Flash doesn't care whether it's a surrogate code point or not.
+                //   We should probably rethink using Rust's char for Flash characters.
+                let character = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
                 code_point_to_glyph.insert(code, index);
 
                 let glyph = Glyph {
                     shape_handle: None.into(),
                     advance: Twips::new(swf_glyph.advance.into()),
                     shape: GlyphShape::Swf(RefCell::new(SwfGlyphOrShape::Glyph(swf_glyph))),
+                    character,
                 };
 
                 // Eager-load ASCII characters.
@@ -491,19 +484,37 @@ impl<'gc> Font<'gc> {
                 FontType::EmbeddedCFF,
             )
         } else {
-            Ok(Font(Gc::new(
+            Ok(Self::empty_font(
                 gc_context,
-                FontData {
-                    scale: 1.0,
-                    ascent: 0,
-                    descent: 0,
-                    leading: 0,
-                    glyphs: GlyphSource::Empty,
-                    descriptor,
-                    font_type: FontType::EmbeddedCFF,
-                },
-            )))
+                &name,
+                tag.is_bold,
+                tag.is_italic,
+                FontType::EmbeddedCFF,
+            ))
         }
+    }
+
+    pub fn empty_font(
+        gc_context: &Mutation<'gc>,
+        name: &str,
+        is_bold: bool,
+        is_italic: bool,
+        font_type: FontType,
+    ) -> Font<'gc> {
+        let descriptor = FontDescriptor::from_parts(name, is_bold, is_italic);
+
+        Font(Gc::new(
+            gc_context,
+            FontData {
+                scale: 1.0,
+                ascent: 0,
+                descent: 0,
+                leading: 0,
+                glyphs: GlyphSource::Empty,
+                descriptor,
+                font_type,
+            },
+        ))
     }
 
     /// Returns whether this font contains glyph shapes.
@@ -581,6 +592,9 @@ impl<'gc> Font<'gc> {
     /// of transforms and glyphs which will be consumed by the `glyph_func`
     /// closure. This corresponds to the series of drawing operations necessary
     /// to render the text on a single horizontal line.
+    ///
+    /// It's guaranteed that this function will iterate over all characters
+    /// from the text, irrespectively of whether they have a glyph or not.
     pub fn evaluate<FGlyph>(
         &self,
         text: &WStr, // TODO: take an `IntoIterator<Item=char>`, to not depend on string representation?
@@ -595,6 +609,9 @@ impl<'gc> Font<'gc> {
 
         transform.matrix.a = scale;
         transform.matrix.d = scale;
+
+        // TODO [KJ] I'm not sure whether we should iterate over characters here or over code units.
+        //   I suspect Flash Player does not support full UTF-16 when displaying and laying out text.
         let mut char_indices = text.char_indices().peekable();
         let has_kerning_info = self.has_kerning_info();
         let mut x = Twips::ZERO;
@@ -611,7 +628,7 @@ impl<'gc> Font<'gc> {
                     let unspaced_advance =
                         round_to_pixel(Twips::new((advance.get() as f32 * scale) as i32));
                     let spaced_advance =
-                        unspaced_advance + round_to_pixel_half_even(params.letter_spacing);
+                        unspaced_advance + params.letter_spacing.round_to_pixel_ties_even();
                     if spaced_advance > Twips::ZERO {
                         spaced_advance
                     } else {
@@ -626,41 +643,28 @@ impl<'gc> Font<'gc> {
                 // Step horizontally.
                 transform.matrix.tx += twips_advance;
                 x += twips_advance;
+            } else {
+                // No glyph, zero advance.  This makes it possible to use this method for purposes
+                // other than rendering the font, e.g. measurement, iterating over characters.
+                glyph_func(pos, &transform, &Glyph::empty(c), Twips::ZERO, x);
             }
         }
     }
 
-    /// Measure a particular string's metrics (width and height).
-    ///
-    /// The `round` flag causes the returned coordinates to be rounded down to
-    /// the nearest pixel.
-    pub fn measure(&self, text: &WStr, params: EvalParameters, round: bool) -> (Twips, Twips) {
+    /// Measure a particular string's width.
+    pub fn measure(&self, text: &WStr, params: EvalParameters) -> Twips {
         let mut width = Twips::ZERO;
-        let mut height = Twips::ZERO;
 
         self.evaluate(
             text,
             Default::default(),
             params,
-            |_pos, transform, _glyph, advance, _x| {
-                let tx = transform.matrix.tx;
-                let ty = transform.matrix.ty;
-
-                if round {
-                    width = width.max(round_down_to_pixel(tx + advance));
-                    height = height.max(round_down_to_pixel(ty));
-                } else {
-                    width = width.max(tx + advance);
-                    height = height.max(ty);
-                }
+            |_pos, _transform, _glyph, advance, x| {
+                width = width.max(x + advance);
             },
         );
 
-        if text.is_empty() {
-            height = max(height, params.height);
-        }
-
-        (width, height)
+        width
     }
 
     /// Given a line of text, find the first breakpoint within the text.
@@ -688,7 +692,7 @@ impl<'gc> Font<'gc> {
         mut is_start_of_line: bool,
     ) -> Option<usize> {
         let mut remaining_width = width - offset;
-        if remaining_width < Twips::from_pixels(0.0) {
+        if remaining_width < Twips::ZERO {
             return Some(0);
         }
 
@@ -702,12 +706,11 @@ impl<'gc> Font<'gc> {
                 // +1 is fine because ' ' is 1 unit
                 text.slice(word_start..word_end + 1).unwrap_or(word),
                 params,
-                false,
             );
 
-            if is_start_of_line && measure.0 > remaining_width {
+            if is_start_of_line && measure > remaining_width {
                 //Failsafe for if we get a word wider than the field.
-                let mut last_passing_breakpoint = (Twips::ZERO, Twips::ZERO);
+                let mut last_passing_breakpoint = Twips::ZERO;
 
                 let cur_slice = &text[word_start..];
                 let mut char_iter = cur_slice.char_indices();
@@ -715,12 +718,11 @@ impl<'gc> Font<'gc> {
                 let mut prev_frag_end = 0;
 
                 char_iter.next(); // No need to check cur_slice[0..0]
-                while last_passing_breakpoint.0 < remaining_width {
+                while last_passing_breakpoint < remaining_width {
                     prev_char_index = word_start + prev_frag_end;
 
                     if let Some((frag_end, _)) = char_iter.next() {
-                        last_passing_breakpoint =
-                            self.measure(&cur_slice[..frag_end], params, false);
+                        last_passing_breakpoint = self.measure(&cur_slice[..frag_end], params);
 
                         prev_frag_end = frag_end;
                     } else {
@@ -729,7 +731,7 @@ impl<'gc> Font<'gc> {
                 }
 
                 return Some(prev_char_index);
-            } else if measure.0 > remaining_width {
+            } else if measure > remaining_width {
                 //The word is wider than our remaining width, return the end of
                 //the line.
                 return Some(line_end);
@@ -740,8 +742,8 @@ impl<'gc> Font<'gc> {
 
                 //If the additional space were to cause an overflow, then
                 //return now.
-                remaining_width -= measure.0;
-                if remaining_width < Twips::from_pixels(0.0) {
+                remaining_width -= measure;
+                if remaining_width < Twips::ZERO {
                     return Some(word_end);
                 }
             }
@@ -805,7 +807,7 @@ impl GlyphShape {
                 let mut glyph = glyph.borrow_mut();
                 Some(renderer.register_shape((&*glyph.shape()).into(), &NullBitmapSource))
             }
-            GlyphShape::Drawing(drawing) => Some(drawing.register_or_replace(renderer)),
+            GlyphShape::Drawing(drawing) => drawing.register_or_replace(renderer),
             GlyphShape::None => None,
         }
     }
@@ -820,9 +822,22 @@ pub struct Glyph {
 
     shape: GlyphShape,
     advance: Twips,
+
+    // The character this glyph represents.
+    character: char,
 }
 
 impl Glyph {
+    /// Returns an empty glyph with zero advance.
+    pub fn empty(character: char) -> Self {
+        Self {
+            shape_handle: Default::default(),
+            shape: GlyphShape::None,
+            advance: Twips::ZERO,
+            character,
+        }
+    }
+
     pub fn shape_handle(&self, renderer: &mut dyn RenderBackend) -> Option<ShapeHandle> {
         self.shape_handle
             .borrow_mut()
@@ -836,6 +851,10 @@ impl Glyph {
 
     pub fn advance(&self) -> Twips {
         self.advance
+    }
+
+    pub fn character(&self) -> char {
+        self.character
     }
 }
 
@@ -1106,35 +1125,31 @@ impl Default for TextRenderSettings {
 
 #[cfg(test)]
 mod tests {
-    use crate::font::{EvalParameters, Font, FontType};
+    use crate::font::{EvalParameters, Font, FontDescriptor, FontType};
     use crate::string::WStr;
+    use flate2::read::DeflateDecoder;
     use gc_arena::{rootless_arena, Mutation};
-    use ruffle_render::backend::{null::NullRenderer, ViewportDimensions};
+    use std::borrow::Cow;
+    use std::io::Read;
     use swf::Twips;
 
-    const DEVICE_FONT_TAG: &[u8] = include_bytes!("../assets/noto-sans-definefont3.bin");
+    const DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans-regular.subset.ttf.gz");
 
     fn with_device_font<F>(callback: F)
     where
         F: for<'gc> FnOnce(&Mutation<'gc>, Font<'gc>),
     {
         rootless_arena(|mc| {
-            let mut renderer = NullRenderer::new(ViewportDimensions {
-                width: 0,
-                height: 0,
-                scale_factor: 1.0,
-            });
-            let mut reader = swf::read::Reader::new(DEVICE_FONT_TAG, 8);
-            let device_font = Font::from_swf_tag(
-                mc,
-                &mut renderer,
-                reader
-                    .read_define_font_2(3)
-                    .expect("Built-in font should compile"),
-                reader.encoding(),
-                FontType::Device,
-            );
+            let mut data = Vec::new();
+            let mut decoder = DeflateDecoder::new(DEVICE_FONT);
+            decoder
+                .read_to_end(&mut data)
+                .expect("default font decompression must succeed");
 
+            let descriptor = FontDescriptor::from_parts("Noto Sans", false, false);
+            let device_font =
+                Font::from_font_file(mc, descriptor, Cow::Owned(data), 0, FontType::Device)
+                    .unwrap();
             callback(mc, device_font);
         })
     }
@@ -1142,16 +1157,10 @@ mod tests {
     #[test]
     fn wrap_line_no_breakpoint() {
         with_device_font(|_mc, df| {
-            let params =
-                EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::from_pixels(0.0), true);
+            let params = EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::ZERO, true);
             let string = WStr::from_units(b"abcdefghijklmnopqrstuv");
-            let breakpoint = df.wrap_line(
-                string,
-                params,
-                Twips::from_pixels(200.0),
-                Twips::from_pixels(0.0),
-                true,
-            );
+            let breakpoint =
+                df.wrap_line(string, params, Twips::from_pixels(200.0), Twips::ZERO, true);
 
             assert_eq!(None, breakpoint);
         });
@@ -1160,17 +1169,11 @@ mod tests {
     #[test]
     fn wrap_line_breakpoint_every_word() {
         with_device_font(|_mc, df| {
-            let params =
-                EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::from_pixels(0.0), true);
+            let params = EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::ZERO, true);
             let string = WStr::from_units(b"abcd efgh ijkl mnop");
             let mut last_bp = 0;
-            let breakpoint = df.wrap_line(
-                string,
-                params,
-                Twips::from_pixels(35.0),
-                Twips::from_pixels(0.0),
-                true,
-            );
+            let breakpoint =
+                df.wrap_line(string, params, Twips::from_pixels(35.0), Twips::ZERO, true);
 
             assert_eq!(Some(4), breakpoint);
 
@@ -1180,7 +1183,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(35.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1192,7 +1195,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(35.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1204,7 +1207,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(35.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1215,8 +1218,7 @@ mod tests {
     #[test]
     fn wrap_line_breakpoint_no_room() {
         with_device_font(|_mc, df| {
-            let params =
-                EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::from_pixels(0.0), true);
+            let params = EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::ZERO, true);
             let string = WStr::from_units(b"abcd efgh ijkl mnop");
             let breakpoint = df.wrap_line(
                 string,
@@ -1233,17 +1235,11 @@ mod tests {
     #[test]
     fn wrap_line_breakpoint_irregular_sized_words() {
         with_device_font(|_mc, df| {
-            let params =
-                EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::from_pixels(0.0), true);
+            let params = EvalParameters::from_parts(Twips::from_pixels(12.0), Twips::ZERO, true);
             let string = WStr::from_units(b"abcdi j kl mnop q rstuv");
             let mut last_bp = 0;
-            let breakpoint = df.wrap_line(
-                string,
-                params,
-                Twips::from_pixels(37.0),
-                Twips::from_pixels(0.0),
-                true,
-            );
+            let breakpoint =
+                df.wrap_line(string, params, Twips::from_pixels(37.0), Twips::ZERO, true);
 
             assert_eq!(Some(5), breakpoint);
 
@@ -1253,7 +1249,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(37.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1265,7 +1261,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(37.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1277,7 +1273,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(37.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 
@@ -1289,7 +1285,7 @@ mod tests {
                 &string[last_bp..],
                 params,
                 Twips::from_pixels(37.0),
-                Twips::from_pixels(0.0),
+                Twips::ZERO,
                 true,
             );
 

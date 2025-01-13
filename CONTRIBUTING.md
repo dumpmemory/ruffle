@@ -73,6 +73,17 @@ This will also enable printing `trace()` statements.
 
 Additionally, if you build Ruffle with `--features avm_debug` then you will activate a few more built-in debugging utilities inside Ruffle, listed below.
 
+### Logging caught exceptions
+
+Some SWFs may catch and suppress exceptions, which can hide the fact that the SWF is trying to use an unimplemented definition. To log call caught exceptions:
+
+1. Add `avm_caught=info` to your `RUST_LOG` environment variable (e.g. `RUST_LOG=warn,avm_caught=debug`)
+2. Build ruffle with `--features avm_debug`
+
+Caught exceptions will be logged as "Caught exception: <exception object>"
+Note that some SWFs throw and catch exceptions as part of their normal control flow, so a caught exception
+does not necessarily indicate a bug in Ruffle.
+
 ### Warnings and Errors
 
 All AVM errors and warnings will print their stack trace so that you can view where they are in relation to the
@@ -191,7 +202,9 @@ Adobe Flash Professional CS6 is the most recent version to support both ActionSc
 
 ### Motion-Twin ActionScript 2 Compiler
 
-This is a free and open source command-line ActionScript 2 compiler. It can be downloaded from [here](http://tech.motion-twin.com/mtasc.html#download).
+This is a free and open source command-line ActionScript 2 compiler. It can be downloaded from [here](https://web.archive.org/web/20230315095249/http://tech.motion-twin.com/mtasc.html#download).
+
+Linux requires the `gcc-multilib` package.
 
 Create a `test.as` file in a text editor, per the following template:
 
@@ -220,7 +233,7 @@ This is a free and open source SDK capable of compiling ActionScript 3 code. It 
 4. Define the `FLEX_HOME` and `PLAYERGLOBAL_HOME` environment variables to the path of the extracted SDK root, and the path of the `<sdk-root>/frameworks/libs/player` subdirectory, respectively.
 5. Edit `<sdk-root>/frameworks/flex-config.xml` and change `<target-player>27.0</target-player>` to `<target-player>32.0</target-player>`.
 
-After `mxmlc` is set up, create a file `test.as` in a text editor, per the following template:
+After `mxmlc` is set up, create a file `Test.as` (note the capitalization) in a text editor, per the following template:
 
 ```as
 package {
@@ -234,10 +247,10 @@ trace("Hello World!");
 Then compile it using:
 
 ```sh
-mxmlc -output test.swf -compiler.debug=true Test.as
+mxmlc -o test.swf -debug Test.as
 ```
 
-You may want to use Docker instead - something like `docker run -it --rm -v ${PWD}:/src jeko/airbuild mxmlc -output test.swf -compiler.debug=true Test.as` works well.
+You may want to use Docker instead - something like `docker run -it --rm -v ${PWD}:/src jeko/airbuild mxmlc -o test.swf -debug Test.as` works well.
 
 ### RABCDAsm
 

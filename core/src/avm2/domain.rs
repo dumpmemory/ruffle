@@ -10,6 +10,7 @@ use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::QName;
+use crate::context::UpdateContext;
 use gc_arena::{Collect, GcCell, GcWeakCell, Mutation};
 use ruffle_wstr::WStr;
 
@@ -36,7 +37,7 @@ struct DomainData<'gc> {
 
     /// A map of all Clasess defined in this domain. Used by ClassObject
     /// to perform early interface resolution.
-    classes: PropertyMap<'gc, GcCell<'gc, Class<'gc>>>,
+    classes: PropertyMap<'gc, Class<'gc>>,
 
     /// The parent domain.
     parent: Option<Domain<'gc>>,
@@ -89,7 +90,7 @@ impl<'gc> Domain<'gc> {
         domain
     }
 
-    pub fn classes(&self) -> Ref<'_, PropertyMap<'gc, GcCell<'gc, Class<'gc>>>> {
+    pub fn classes(&self) -> Ref<'_, PropertyMap<'gc, Class<'gc>>> {
         Ref::map(self.0.read(), |r| &r.classes)
     }
 
@@ -117,7 +118,7 @@ impl<'gc> Domain<'gc> {
     /// fully allocated.
     pub fn movie_domain(activation: &mut Activation<'_, 'gc>, parent: Domain<'gc>) -> Domain<'gc> {
         let this = Self(GcCell::new(
-            activation.context.gc_context,
+            activation.gc(),
             DomainData {
                 defs: PropertyMap::new(),
                 classes: PropertyMap::new(),
@@ -132,7 +133,7 @@ impl<'gc> Domain<'gc> {
 
         parent
             .0
-            .write(activation.context.gc_context)
+            .write(activation.gc())
             .children
             .push(DomainWeak(GcCell::downgrade(this.0)));
 
@@ -198,7 +199,7 @@ impl<'gc> Domain<'gc> {
         Ok(None)
     }
 
-    fn get_class_inner(self, multiname: &Multiname<'gc>) -> Option<GcCell<'gc, Class<'gc>>> {
+    fn get_class_inner(self, multiname: &Multiname<'gc>) -> Option<Class<'gc>> {
         let read = self.0.read();
         if let Some(class) = read.classes.get_for_multiname(multiname).copied() {
             return Some(class);
@@ -213,20 +214,20 @@ impl<'gc> Domain<'gc> {
 
     pub fn get_class(
         self,
+        context: &mut UpdateContext<'gc>,
         multiname: &Multiname<'gc>,
-        mc: &Mutation<'gc>,
-    ) -> Option<GcCell<'gc, Class<'gc>>> {
+    ) -> Option<Class<'gc>> {
         let class = self.get_class_inner(multiname);
 
         if let Some(class) = class {
             if let Some(param) = multiname.param() {
-                if !param.is_any_name() {
-                    if let Some(resolved_param) = self.get_class(&param, mc) {
-                        return Some(Class::with_type_param(class, Some(resolved_param), mc));
+                if let Some(param) = param {
+                    if let Some(resolved_param) = self.get_class(context, &param) {
+                        return Some(Class::with_type_param(context, class, Some(resolved_param)));
                     }
                     return None;
                 } else {
-                    return Some(Class::with_type_param(class, None, mc));
+                    return Some(Class::with_type_param(context, class, None));
                 }
             }
         }
@@ -262,8 +263,8 @@ impl<'gc> Domain<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: QName<'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let (name, mut script) = self.find_defining_script(activation, &name.into())?;
-        let globals = script.globals(&mut activation.context)?;
+        let (name, script) = self.find_defining_script(activation, &name.into())?;
+        let globals = script.globals(activation.context)?;
 
         globals.get_property(&name.into(), activation)
     }
@@ -285,20 +286,19 @@ impl<'gc> Domain<'gc> {
             let start = name.find(WStr::from_units(b".<")).unwrap();
 
             type_name = Some(AvmString::new(
-                activation.context.gc_context,
+                activation.gc(),
                 &name[(start + 2)..(name.len() - 1)],
             ));
             name = "__AS3__.vec::Vector".into();
         }
         // FIXME - is this the correct api version?
         let api_version = activation.avm2().root_api_version;
-        let name = QName::from_qualified_name(name, api_version, activation);
+        let name = QName::from_qualified_name(name, api_version, activation.context);
 
         let res = self.get_defined_value(activation, name);
 
         if let Some(type_name) = type_name {
-            let type_qname = QName::from_qualified_name(type_name, api_version, activation);
-            let type_class = self.get_defined_value(activation, type_qname)?;
+            let type_class = self.get_defined_value_handling_vector(activation, type_name)?;
             if let Ok(res) = res {
                 let class = res.as_object().ok_or_else(|| {
                     Error::RustError(format!("Vector type {:?} was not an object", res).into())
@@ -332,12 +332,7 @@ impl<'gc> Domain<'gc> {
     /// Export a class into the current application domain.
     ///
     /// This does nothing if the definition already exists in this domain or a parent.
-    pub fn export_class(
-        &self,
-        export_name: QName<'gc>,
-        class: GcCell<'gc, Class<'gc>>,
-        mc: &Mutation<'gc>,
-    ) {
+    pub fn export_class(&self, export_name: QName<'gc>, class: Class<'gc>, mc: &Mutation<'gc>) {
         if self.has_class(export_name) {
             return;
         }
@@ -369,7 +364,7 @@ impl<'gc> Domain<'gc> {
         activation: &mut Activation<'_, 'gc>,
         domain_memory: Option<ByteArrayObject<'gc>>,
     ) -> Result<(), Error<'gc>> {
-        let mut write = self.0.write(activation.context.gc_context);
+        let mut write = self.0.write(activation.gc());
         let memory = if let Some(domain_memory) = domain_memory {
             if domain_memory.storage().len() < MIN_DOMAIN_MEMORY_LENGTH {
                 return Err(Error::AvmError(error(
@@ -402,11 +397,11 @@ impl<'gc> Domain<'gc> {
 
         let domain_memory = bytearray_class.construct(activation, &[])?;
         domain_memory
-            .as_bytearray_mut(activation.context.gc_context)
+            .as_bytearray_mut()
             .unwrap()
             .set_length(MIN_DOMAIN_MEMORY_LENGTH);
 
-        let mut write = self.0.write(activation.context.gc_context);
+        let mut write = self.0.write(activation.gc());
 
         assert!(
             write.domain_memory.is_none(),
@@ -432,10 +427,10 @@ impl<'gc> Domain<'gc> {
 
 pub enum DomainPtr {}
 
-impl<'gc> PartialEq for Domain<'gc> {
+impl PartialEq for Domain<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_ptr() == other.0.as_ptr()
     }
 }
 
-impl<'gc> Eq for Domain<'gc> {}
+impl Eq for Domain<'_> {}

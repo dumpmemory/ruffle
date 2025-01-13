@@ -1,10 +1,10 @@
 use crate::avm1::{PropertyMap as Avm1PropertyMap, PropertyMap};
-use crate::avm2::{ClassObject as Avm2ClassObject, Domain as Avm2Domain};
+use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
 use crate::backend::audio::SoundHandle;
 use crate::character::Character;
 use std::borrow::Cow;
 
-use crate::display_object::{Bitmap, Graphic, MorphShape, TDisplayObject, Text};
+use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
 use crate::font::{Font, FontDescriptor, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
@@ -19,7 +19,6 @@ use crate::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use swf::CharacterId;
 use weak_table::{traits::WeakElement, PtrWeakKeyHashMap, WeakValueHashMap};
 
 #[derive(Clone)]
@@ -49,7 +48,7 @@ impl WeakElement for WeakMovieSymbol {
 pub struct Avm2ClassRegistry<'gc> {
     /// A list of AVM2 class objects and the character IDs they are expected to
     /// instantiate.
-    class_map: WeakValueHashMap<Avm2ClassObject<'gc>, WeakMovieSymbol>,
+    class_map: WeakValueHashMap<Avm2Class<'gc>, WeakMovieSymbol>,
 }
 
 unsafe impl Collect for Avm2ClassRegistry<'_> {
@@ -77,24 +76,21 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     ///
     /// A value of `None` indicates that this AVM2 class is not associated with
     /// a library symbol.
-    pub fn class_symbol(
-        &self,
-        class_object: Avm2ClassObject<'gc>,
-    ) -> Option<(Arc<SwfMovie>, CharacterId)> {
-        match self.class_map.get(&class_object) {
+    pub fn class_symbol(&self, class_def: Avm2Class<'gc>) -> Option<(Arc<SwfMovie>, CharacterId)> {
+        match self.class_map.get(&class_def) {
             Some(MovieSymbol(movie, symbol)) => Some((movie, symbol)),
             None => None,
         }
     }
 
-    /// Associate an AVM2 class object with a given library symbol.
+    /// Associate an AVM2 class definition with a given library symbol.
     pub fn set_class_symbol(
         &mut self,
-        class_object: Avm2ClassObject<'gc>,
+        class_def: Avm2Class<'gc>,
         movie: Arc<SwfMovie>,
         symbol: CharacterId,
     ) {
-        if let Some(old) = self.class_map.get(&class_object) {
+        if let Some(old) = self.class_map.get(&class_def) {
             if Arc::ptr_eq(&movie, &old.0) && symbol != old.1 {
                 // Flash player actually allows using the same class in multiple SymbolClass
                 // entries in the same swf, with *different* symbol ids. Whichever one
@@ -103,7 +99,7 @@ impl<'gc> Avm2ClassRegistry<'gc> {
                 // of deliberately crafted SWFs.
                 tracing::warn!(
                     "Tried to overwrite class {:?} id={:?} with symbol id={:?} from same movie",
-                    class_object,
+                    class_def,
                     old.1,
                     symbol,
                 );
@@ -115,8 +111,7 @@ impl<'gc> Avm2ClassRegistry<'gc> {
             // instantiates the clip on the timeline.
             return;
         }
-        self.class_map
-            .insert(class_object, MovieSymbol(movie, symbol));
+        self.class_map.insert(class_def, MovieSymbol(movie, symbol));
     }
 }
 
@@ -127,6 +122,7 @@ pub struct MovieLibrary<'gc> {
     swf: Arc<SwfMovie>,
     characters: HashMap<CharacterId, Character<'gc>>,
     export_characters: Avm1PropertyMap<'gc, CharacterId>,
+    imported_assets: HashMap<AvmString<'gc>, CharacterId>,
     jpeg_tables: Option<Vec<u8>>,
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
@@ -137,6 +133,7 @@ impl<'gc> MovieLibrary<'gc> {
         Self {
             swf,
             characters: HashMap::new(),
+            imported_assets: HashMap::new(),
             export_characters: Avm1PropertyMap::new(),
             jpeg_tables: None,
             fonts: Default::default(),
@@ -189,6 +186,14 @@ impl<'gc> MovieLibrary<'gc> {
             return Some((*id, self.characters.get(id).unwrap()));
         }
         None
+    }
+
+    pub fn character_id_by_import_name(&self, name: AvmString<'gc>) -> Option<CharacterId> {
+        self.imported_assets.get(&name).copied()
+    }
+
+    pub fn register_import(&mut self, name: AvmString<'gc>, id: CharacterId) {
+        self.imported_assets.insert(name, id);
     }
 
     /// Instantiates the library item with the given character ID into a display object.
@@ -347,10 +352,9 @@ impl<'gc> MovieLibrary<'gc> {
 
 pub struct MovieLibrarySource<'a, 'gc> {
     pub library: &'a MovieLibrary<'gc>,
-    pub gc_context: &'a Mutation<'gc>,
 }
 
-impl<'a, 'gc> ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'a, 'gc> {
+impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
     fn bitmap_size(&self, id: u16) -> Option<ruffle_render::bitmap::BitmapSize> {
         if let Some(Character::Bitmap { compressed, .. }) = self.library.characters.get(&id) {
             Some(compressed.size())
@@ -420,7 +424,7 @@ pub struct Library<'gc> {
     avm2_class_registry: Avm2ClassRegistry<'gc>,
 }
 
-unsafe impl<'gc> gc_arena::Collect for Library<'gc> {
+unsafe impl gc_arena::Collect for Library<'_> {
     #[inline]
     fn trace(&self, cc: &gc_arena::Collection) {
         for (_, val) in self.movie_libraries.iter() {
@@ -487,6 +491,7 @@ impl<'gc> Library<'gc> {
                 .get_or_load_exact_device_font(&name, is_bold, is_italic, ui, renderer, gc_context)
             {
                 result.push(font);
+                break; // TODO: Return multiple fonts when it's needed.
             }
         }
 
@@ -498,6 +503,7 @@ impl<'gc> Library<'gc> {
                         .find(&name, FontType::Device, is_bold, is_italic)
                 {
                     result.push(font);
+                    break; // TODO: Return multiple fonts when it's needed.
                 }
             }
         }
@@ -589,7 +595,9 @@ impl<'gc> Library<'gc> {
                 let font =
                     Font::from_swf_tag(gc_context, renderer, tag, encoding, FontType::Device);
                 let name = font.descriptor().name().to_owned();
-                info!("Loaded new device font \"{name}\" from swf tag");
+                let is_bold = font.descriptor().bold();
+                let is_italic = font.descriptor().italic();
+                info!("Loaded new device font \"{name}\" (bold: {is_bold}, italic: {is_italic}) from swf tag");
                 self.device_fonts.register(font);
             }
             FontDefinition::FontFile {
@@ -608,7 +616,7 @@ impl<'gc> Library<'gc> {
                     FontType::Device,
                 ) {
                     let name = font.descriptor().name().to_owned();
-                    info!("Loaded new device font \"{name}\" from file");
+                    info!("Loaded new device font \"{name}\" (bold: {is_bold}, italic: {is_italic}) from file");
                     self.device_fonts.register(font);
                 } else {
                     warn!("Failed to load device font from file");

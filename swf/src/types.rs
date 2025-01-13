@@ -276,7 +276,7 @@ bitflags! {
 
         /// Whether this SWF should be placed in the network sandbox when run locally.
         ///
-        /// SWFs in the network sandbox can only access network resources,  not local resources.
+        /// SWFs in the network sandbox can only access network resources, not local resources.
         /// SWFs in the local sandbox can only access local resources, not network resources.
         const USE_NETWORK_SANDBOX = 1 << 0;
     }
@@ -1026,6 +1026,7 @@ pub enum AudioCompression {
     Nellymoser16Khz = 4,
     Nellymoser8Khz = 5,
     Nellymoser = 6,
+    Aac = 10,
     Speex = 11,
 }
 
@@ -1575,7 +1576,7 @@ impl<'a> EditText<'a> {
     }
 }
 
-impl<'a> Default for EditText<'a> {
+impl Default for EditText<'_> {
     fn default() -> Self {
         Self {
             id: Default::default(),
@@ -1742,6 +1743,7 @@ pub enum VideoCodec {
     Vp6 = 4,
     Vp6WithAlpha = 5,
     ScreenVideoV2 = 6,
+    H264 = 7,
 }
 
 impl VideoCodec {
@@ -1784,7 +1786,8 @@ pub type DoAction<'a> = &'a [u8];
 
 pub type JpegTables<'a> = &'a [u8];
 
-/// `ProductInfo` contains information about the software used to generate the SWF.
+/// Contains information about the software used to generate the SWF.
+///
 /// Not documented in the SWF19 reference. Emitted by mxmlc.
 /// See <http://wahlers.com.br/claus/blog/undocumented-swf-tags-written-by-mxmlc/>
 #[derive(Clone, Debug, Eq, PartialEq)]

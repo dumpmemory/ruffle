@@ -8,7 +8,6 @@ use crate::avm1::ExecutionReason;
 use crate::avm1::{
     Activation, ActivationIdentifier, Object as Avm1Object, TObject as _, Value as Avm1Value,
 };
-use crate::avm2::object::TObject;
 use crate::avm2::{Activation as Avm2Activation, Object as Avm2Object, Value as Avm2Value};
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, TDisplayObject};
@@ -30,7 +29,7 @@ pub struct Timers<'gc> {
 
 impl<'gc> Timers<'gc> {
     /// Ticks all timers and runs necessary callbacks.
-    pub fn update_timers(context: &mut UpdateContext<'_, 'gc>, dt: f64) -> Option<f64> {
+    pub fn update_timers(context: &mut UpdateContext<'gc>, dt: f64) -> Option<f64> {
         context.timers.cur_time = context
             .timers
             .cur_time
@@ -71,7 +70,7 @@ impl<'gc> Timers<'gc> {
                 TimerCallback::Avm1Function { func, params } => {
                     if let Some(level0) = level0 {
                         let mut avm1_activation = Activation::from_nothing(
-                            context.reborrow(),
+                            context,
                             ActivationIdentifier::root("[Timer Callback]"),
                             level0,
                         );
@@ -116,7 +115,7 @@ impl<'gc> Timers<'gc> {
                     if !removed {
                         if let Some(level0) = level0 {
                             let mut avm1_activation = Activation::from_nothing(
-                                context.reborrow(),
+                                context,
                                 ActivationIdentifier::root("[Timer Callback]"),
                                 level0,
                             );
@@ -141,9 +140,12 @@ impl<'gc> Timers<'gc> {
                 }
                 TimerCallback::Avm2Callback { closure, params } => {
                     let domain = context.avm2.stage_domain();
-                    let mut avm2_activation =
-                        Avm2Activation::from_domain(context.reborrow(), domain);
-                    match closure.call(Avm2Value::Null, &params, &mut avm2_activation) {
+                    let mut avm2_activation = Avm2Activation::from_domain(context, domain);
+                    match Avm2Value::from(closure).call(
+                        &mut avm2_activation,
+                        Avm2Value::Null,
+                        &params,
+                    ) {
                         Ok(v) => v.coerce_to_boolean(),
                         Err(e) => {
                             tracing::error!("Unhandled AVM2 error in timer callback: {e:?}",);
@@ -279,6 +281,7 @@ impl<'gc> Timers<'gc> {
         if let Some(mut timer) = timer {
             self.remove(id);
             timer.interval = interval;
+            timer.tick_time = self.cur_time + interval;
             self.timers.push(timer);
         } else {
             panic!("Changing delay of non-existent timer");
@@ -304,7 +307,7 @@ impl Default for Timers<'_> {
     }
 }
 
-unsafe impl<'gc> Collect for Timers<'gc> {
+unsafe impl Collect for Timers<'_> {
     fn trace(&self, cc: &gc_arena::Collection) {
         for timer in &self.timers {
             timer.trace(cc);

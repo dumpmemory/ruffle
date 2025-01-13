@@ -35,6 +35,8 @@ pub struct WebCanvasRenderBackend {
     viewport_width: u32,
     viewport_height: u32,
     rect: Path2d,
+    line: Path2d,
+    line_rect: Path2d,
     mask_state: MaskState,
     blend_modes: Vec<RenderBlendMode>,
 
@@ -294,6 +296,17 @@ impl WebCanvasRenderBackend {
         let rect = Path2d::new().into_js_result()?;
         rect.rect(0.0, 0.0, 1.0, 1.0);
 
+        let line = Path2d::new().into_js_result()?;
+        line.move_to(0.0, 0.0);
+        line.line_to(1.0, 0.0);
+
+        let line_rect = Path2d::new().into_js_result()?;
+        line_rect.move_to(0.0, 0.0);
+        line_rect.line_to(1.0, 0.0);
+        line_rect.line_to(1.0, 1.0);
+        line_rect.line_to(0.0, 1.0);
+        line_rect.close_path();
+
         let renderer = Self {
             canvas: canvas.clone(),
             color_matrix,
@@ -302,6 +315,8 @@ impl WebCanvasRenderBackend {
             viewport_height: 0,
             viewport_scale_factor: 1.0,
             rect,
+            line,
+            line_rect,
             mask_state: MaskState::DrawContent,
             blend_modes: vec![RenderBlendMode::Builtin(BlendMode::Normal)],
         };
@@ -361,6 +376,20 @@ impl WebCanvasRenderBackend {
         self.context.set_global_alpha(1.0);
     }
 
+    #[inline]
+    fn set_line_style(&self, color: Color) {
+        self.context.set_line_cap("butt");
+        self.context.set_line_width(1.0);
+        self.context.set_line_join("miter");
+        self.context.set_stroke_style_str(&format!(
+            "rgba({},{},{},{})",
+            color.r,
+            color.g,
+            color.b,
+            f32::from(color.a) / 255.0,
+        ));
+    }
+
     fn apply_blend_mode(&mut self, blend: RenderBlendMode) {
         // TODO: Objects with a blend mode need to be rendered to an intermediate buffer first,
         // but for now we render each child directly to the canvas. This should look reasonable for most
@@ -397,7 +426,7 @@ impl WebCanvasRenderBackend {
 
         if clear.a > 0 {
             let color = format!("rgba({}, {}, {}, {})", clear.r, clear.g, clear.b, clear.a);
-            self.context.set_fill_style(&color.into());
+            self.context.set_fill_style_str(&color);
             let _ = self.context.set_global_composite_operation("copy");
             self.context
                 .fill_rect(0.0, 0.0, width.into(), height.into());
@@ -426,6 +455,31 @@ impl WebCanvasRenderBackend {
             .unwrap_or(&RenderBlendMode::Builtin(BlendMode::Normal));
         if !same_blend_mode(old.as_ref(), current) {
             self.apply_blend_mode(current.clone());
+        }
+    }
+
+    fn draw_lines(&mut self, color: Color, mut matrix: Matrix, rect: bool) {
+        matrix.tx += Twips::HALF_PX;
+        matrix.ty += Twips::HALF_PX;
+        let dom_matrix = matrix.to_dom_matrix();
+        let stroke = if rect { &self.line_rect } else { &self.line };
+        match &self.mask_state {
+            MaskState::DrawContent => {
+                self.clear_color_filter();
+
+                // The transform needs to be applied to the path directly,
+                // otherwise its thickness will also be transformed.
+                let _ = self.context.reset_transform();
+                let transformed_stroke = Path2d::new().expect("new Path2d");
+                transformed_stroke.add_path_with_transformation(stroke, dom_matrix.unchecked_ref());
+
+                self.set_line_style(color);
+                self.context.stroke_with_path(&transformed_stroke);
+            }
+            MaskState::DrawMask(mask_path) => {
+                mask_path.add_path_with_transformation(stroke, dom_matrix.unchecked_ref());
+            }
+            MaskState::ClearMask => (),
         }
     }
 }
@@ -594,7 +648,7 @@ impl CommandHandler for WebCanvasRenderBackend {
                             match fill_style {
                                 CanvasFillStyle::Color(color) => {
                                     let color = color.color_transform(&transform.color_transform);
-                                    self.context.set_fill_style(&color.1.into());
+                                    self.context.set_fill_style_str(&color.1);
                                     self.context.fill_with_path_2d_and_winding(
                                         path,
                                         CanvasWindingRule::Evenodd,
@@ -602,7 +656,8 @@ impl CommandHandler for WebCanvasRenderBackend {
                                 }
                                 CanvasFillStyle::Gradient(gradient) => {
                                     self.set_color_filter(&transform);
-                                    self.context.set_fill_style(&gradient.gradient);
+                                    self.context
+                                        .set_fill_style_canvas_gradient(&gradient.gradient);
 
                                     if let Some(gradient_transform) = &gradient.transform {
                                         // Canvas has no easy way to draw gradients with an arbitrary transform,
@@ -636,7 +691,7 @@ impl CommandHandler for WebCanvasRenderBackend {
                                 CanvasFillStyle::Bitmap(bitmap) => {
                                     self.set_color_filter(&transform);
                                     self.context.set_image_smoothing_enabled(bitmap.smoothed);
-                                    self.context.set_fill_style(&bitmap.pattern);
+                                    self.context.set_fill_style_canvas_pattern(&bitmap.pattern);
                                     self.context.fill_with_path_2d_and_winding(
                                         path,
                                         CanvasWindingRule::Evenodd,
@@ -674,7 +729,7 @@ impl CommandHandler for WebCanvasRenderBackend {
                             match stroke_style {
                                 CanvasStrokeStyle::Color(color) => {
                                     let color = color.color_transform(&transform.color_transform);
-                                    self.context.set_stroke_style(&color.1.into());
+                                    self.context.set_stroke_style_str(&color.1);
                                     self.context.stroke_with_path(&transformed_path);
                                 }
                                 CanvasStrokeStyle::Gradient(gradient, focal_point) => {
@@ -702,7 +757,8 @@ impl CommandHandler for WebCanvasRenderBackend {
                                     };
                                     if let Ok(gradient) = gradient {
                                         self.set_color_filter(&transform);
-                                        self.context.set_stroke_style(&gradient.gradient);
+                                        self.context
+                                            .set_stroke_style_canvas_gradient(&gradient.gradient);
                                         self.context.stroke_with_path(&transformed_path);
                                         self.clear_color_filter();
                                     }
@@ -717,7 +773,8 @@ impl CommandHandler for WebCanvasRenderBackend {
                                     );
                                     self.set_color_filter(&transform);
                                     self.context.set_image_smoothing_enabled(bitmap.smoothed);
-                                    self.context.set_stroke_style(&bitmap.pattern);
+                                    self.context
+                                        .set_stroke_style_canvas_pattern(&bitmap.pattern);
                                     self.context.stroke_with_path(&transformed_path);
                                     self.clear_color_filter();
                                 }
@@ -750,16 +807,13 @@ impl CommandHandler for WebCanvasRenderBackend {
             MaskState::DrawContent => {
                 self.set_transform(&matrix);
                 self.clear_color_filter();
-                self.context.set_fill_style(
-                    &format!(
-                        "rgba({},{},{},{})",
-                        color.r,
-                        color.g,
-                        color.b,
-                        f32::from(color.a) / 255.0
-                    )
-                    .into(),
-                );
+                self.context.set_fill_style_str(&format!(
+                    "rgba({},{},{},{})",
+                    color.r,
+                    color.g,
+                    color.b,
+                    f32::from(color.a) / 255.0
+                ));
                 self.context.fill_rect(0.0, 0.0, 1.0, 1.0);
             }
             MaskState::DrawMask(mask_path) => {
@@ -770,6 +824,14 @@ impl CommandHandler for WebCanvasRenderBackend {
             }
             MaskState::ClearMask => (),
         }
+    }
+
+    fn draw_line(&mut self, color: Color, matrix: Matrix) {
+        self.draw_lines(color, matrix, false);
+    }
+
+    fn draw_line_rect(&mut self, color: Color, matrix: Matrix) {
+        self.draw_lines(color, matrix, true)
     }
 
     fn push_mask(&mut self) {

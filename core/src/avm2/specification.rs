@@ -1,5 +1,5 @@
 use crate::avm2::dynamic_map::DynamicKey;
-use crate::avm2::function::Executable;
+use crate::avm2::function::BoundMethod;
 use crate::avm2::method::{Method, ParamConfig};
 use crate::avm2::object::TObject;
 use crate::avm2::traits::{Trait, TraitKind};
@@ -64,7 +64,7 @@ fn format_signature(params: &[ParamConfig], is_variadic: bool) -> Vec<ParamInfo>
         result.push(ParamInfo {
             type_info: param
                 .param_type_name
-                .local_name()
+                .and_then(|m| m.local_name())
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "*".to_string()),
             value: param.default_value.and_then(|v| format_value(&v)),
@@ -158,7 +158,7 @@ impl FunctionInfo {
         Self {
             returns: method
                 .return_type()
-                .local_name()
+                .and_then(|m| m.local_name())
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "void".to_string()),
             args: format_signature(method.signature(), method.is_variadic()),
@@ -166,11 +166,11 @@ impl FunctionInfo {
         }
     }
 
-    pub fn from_executable(executable: &Executable, stubbed: bool) -> Self {
+    pub fn from_bound_method(executable: &BoundMethod, stubbed: bool) -> Self {
         Self {
             returns: executable
                 .return_type()
-                .local_name()
+                .and_then(|m| m.local_name())
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "void".to_string()),
             args: format_signature(executable.signature(), executable.is_variadic()),
@@ -269,22 +269,24 @@ impl Definition {
         stubs: &ClassStubs,
     ) -> Self {
         let mut definition = Self::default();
-        let class = class_object.inner_class_definition();
+        let i_class = class_object.inner_class_definition();
+        let c_class = i_class
+            .c_class()
+            .expect("inner_class_definition should be an i_class");
 
-        if class.read().is_final() {
+        if i_class.is_final() {
             definition
                 .classinfo
                 .get_or_insert_with(Default::default)
                 .is_final = true;
         }
-        if !class.read().is_sealed() {
+        if !i_class.is_sealed() {
             definition
                 .classinfo
                 .get_or_insert_with(Default::default)
                 .dynamic = true;
         }
-        if let Some(super_name) = class
-            .read()
+        if let Some(super_name) = i_class
             .super_class_name()
             .as_ref()
             .and_then(|n| n.local_name())
@@ -303,9 +305,7 @@ impl Definition {
         for (key, value) in prototype_values.as_hashmap().iter() {
             let name = match key {
                 DynamicKey::String(name) => *name,
-                DynamicKey::Uint(key) => {
-                    AvmString::new_utf8(activation.context.gc_context, key.to_string())
-                }
+                DynamicKey::Uint(key) => AvmString::new_utf8(activation.gc(), key.to_string()),
                 DynamicKey::Object(object) => {
                     Value::Object(*object).coerce_to_string(activation).unwrap()
                 }
@@ -322,13 +322,13 @@ impl Definition {
 
         Self::fill_traits(
             activation.avm2(),
-            class.read().class_traits(),
+            &c_class.traits(),
             &mut definition.static_traits,
             stubs,
         );
         Self::fill_traits(
             activation.avm2(),
-            class.read().instance_traits(),
+            &i_class.traits(),
             &mut definition.instance_traits,
             stubs,
         );
@@ -346,7 +346,7 @@ impl Definition {
             if let Some(executable) = object.as_executable() {
                 output.get_or_insert_with(Default::default).function.insert(
                     name.to_string(),
-                    FunctionInfo::from_executable(&executable, false),
+                    FunctionInfo::from_bound_method(&executable, false),
                 );
             }
         } else {
@@ -368,7 +368,10 @@ impl Definition {
     ) {
         for class_trait in traits {
             if !class_trait.name().namespace().is_public()
-                && class_trait.name().namespace() != avm2.as3_namespace
+                && !class_trait
+                    .name()
+                    .namespace()
+                    .exact_version_match(avm2.namespaces.as3)
             {
                 continue;
             }
@@ -385,7 +388,9 @@ impl Definition {
                         .insert(
                             trait_name,
                             VariableInfo {
-                                type_info: type_name.local_name().map(|n| n.to_string()),
+                                type_info: type_name
+                                    .and_then(|m| m.local_name())
+                                    .map(|n| n.to_string()),
                                 value: format_value(default_value),
                                 stubbed: false,
                             },
@@ -406,7 +411,7 @@ impl Definition {
                             type_info: Some(
                                 method
                                     .return_type()
-                                    .local_name()
+                                    .and_then(|m| m.local_name())
                                     .map(|n| n.to_string())
                                     .unwrap_or_else(|| "*".to_string()),
                             ),
@@ -424,7 +429,8 @@ impl Definition {
                                 method
                                     .signature()
                                     .first()
-                                    .and_then(|p| p.param_type_name.local_name())
+                                    .and_then(|p| p.param_type_name)
+                                    .and_then(|m| m.local_name())
                                     .map(|t| t.to_string())
                                     .unwrap_or_else(|| "*".to_string()),
                             ),
@@ -446,7 +452,9 @@ impl Definition {
                         .insert(
                             trait_name,
                             VariableInfo {
-                                type_info: type_name.local_name().map(|n| n.to_string()),
+                                type_info: type_name
+                                    .and_then(|m| m.local_name())
+                                    .map(|n| n.to_string()),
                                 value: format_value(default_value),
                                 stubbed: false,
                             },
@@ -464,7 +472,7 @@ pub fn capture_specification(context: &mut UpdateContext, output: &Path) {
     let mut definitions = FnvHashMap::<String, Definition>::default();
 
     let defs = context.avm2.playerglobals_domain.defs().clone();
-    let mut activation = Activation::from_nothing(context.reborrow());
+    let mut activation = Activation::from_nothing(context);
     for (name, namespace, _) in defs.iter() {
         let value = activation
             .context
@@ -472,13 +480,17 @@ pub fn capture_specification(context: &mut UpdateContext, output: &Path) {
             .playerglobals_domain
             .get_defined_value(&mut activation, QName::new(namespace, name))
             .expect("Builtins shouldn't error");
+
+        let namespace_uri = namespace.as_uri(activation.strings());
+        let namespace_uri = namespace_uri.to_utf8_lossy();
+        let name = name.to_utf8_lossy();
+
         if let Some(object) = value.as_object() {
             if let Some(class) = object.as_class_object() {
                 let class_name = class
                     .inner_class_definition()
-                    .read()
                     .name()
-                    .to_qualified_name_err_message(activation.context.gc_context)
+                    .to_qualified_name_err_message(activation.gc())
                     .to_string();
                 let class_stubs = ClassStubs::for_class(&class_name, &stubs);
                 definitions.insert(
@@ -486,31 +498,22 @@ pub fn capture_specification(context: &mut UpdateContext, output: &Path) {
                     Definition::from_class(class, &mut activation, &class_stubs),
                 );
             } else if let Some(executable) = object.as_executable() {
-                let namespace_stubs =
-                    ClassStubs::for_class(&namespace.as_uri().to_string(), &stubs);
-                let definition = definitions
-                    .entry(namespace.as_uri().to_string())
-                    .or_default();
+                let namespace_stubs = ClassStubs::for_class(&namespace_uri, &stubs);
+                let definition = definitions.entry(namespace_uri.into()).or_default();
                 let instance_traits = definition
                     .instance_traits
                     .get_or_insert_with(Default::default);
-                instance_traits.function.insert(
-                    name.to_string(),
-                    FunctionInfo::from_executable(
-                        &executable,
-                        namespace_stubs.has_method(&name.to_string()),
-                    ),
-                );
+                let fn_info =
+                    FunctionInfo::from_bound_method(&executable, namespace_stubs.has_method(&name));
+                instance_traits.function.insert(name.into(), fn_info);
             }
         } else {
-            let definition = definitions
-                .entry(namespace.as_uri().to_string())
-                .or_default();
+            let definition = definitions.entry(namespace_uri.into()).or_default();
             let instance_traits = definition
                 .instance_traits
                 .get_or_insert_with(Default::default);
             instance_traits.constants.insert(
-                name.to_string(),
+                name.into(),
                 VariableInfo::from_value(value, &mut activation),
             );
         }

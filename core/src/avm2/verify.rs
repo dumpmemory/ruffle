@@ -1,20 +1,20 @@
 use crate::avm2::class::Class;
 use crate::avm2::error::{
     make_error_1014, make_error_1021, make_error_1025, make_error_1032, make_error_1054,
-    make_error_1107, verify_error,
+    make_error_1107, verify_error, Error1014Type,
 };
-use crate::avm2::method::BytecodeMethod;
+use crate::avm2::method::{BytecodeMethod, ParamConfig, ResolvedParamConfig};
 use crate::avm2::multiname::Multiname;
 use crate::avm2::op::Op;
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::{Activation, Error, QName};
 use crate::string::AvmAtom;
 
-use gc_arena::{Collect, Gc, GcCell};
+use gc_arena::{Collect, Gc};
 use std::collections::{HashMap, HashSet};
 use swf::avm2::read::Reader;
 use swf::avm2::types::{
-    Index, MethodFlags as AbcMethodFlags, Multiname as AbcMultiname, Op as AbcOp,
+    Class as AbcClass, Index, MethodFlags as AbcMethodFlags, Multiname as AbcMultiname, Op as AbcOp,
 };
 use swf::error::Error as AbcReadError;
 
@@ -24,6 +24,9 @@ pub struct VerifiedMethodInfo<'gc> {
     pub parsed_code: Vec<Op<'gc>>,
 
     pub exceptions: Vec<Exception<'gc>>,
+
+    pub param_config: Vec<ResolvedParamConfig<'gc>>,
+    pub return_type: Option<Class<'gc>>,
 }
 
 #[derive(Collect)]
@@ -34,7 +37,7 @@ pub struct Exception<'gc> {
     pub target_offset: u32,
 
     pub variable_name: Option<QName<'gc>>,
-    pub target_class: Option<GcCell<'gc, Class<'gc>>>,
+    pub target_class: Option<Class<'gc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,12 +45,28 @@ enum ByteInfo {
     OpStart(AbcOp),
     OpContinue,
 
+    OpStartNonJumpable(AbcOp),
+
     NotYetReached,
+}
+
+impl ByteInfo {
+    fn get_op(&self) -> Option<&AbcOp> {
+        match self {
+            ByteInfo::OpStart(op) | ByteInfo::OpStartNonJumpable(op) => Some(op),
+            _ => None,
+        }
+    }
+}
+
+pub enum JumpSource {
+    JumpFrom(i32),
+    ExceptionTarget,
 }
 
 pub fn verify_method<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    method: &BytecodeMethod<'gc>,
+    method: Gc<'gc, BytecodeMethod<'gc>>,
 ) -> Result<VerifiedMethodInfo<'gc>, Error<'gc>> {
     let body = method
         .body()
@@ -59,8 +78,13 @@ pub fn verify_method<'gc>(
 
     // Ensure there are enough local variables
     // to fit the parameters in.
-    if (max_locals as usize) < param_count + 1 {
+    if (max_locals as usize) < 1 + param_count {
         return Err(make_error_1107(activation));
+    }
+
+    if (max_locals as usize) < 1 + param_count + if method.is_variadic() { 1 } else { 0 } {
+        // This matches FP's error message
+        return Err(make_error_1025(activation, 1 + param_count as u32));
     }
 
     use swf::extensions::ReadSwfExt;
@@ -72,6 +96,11 @@ pub fn verify_method<'gc>(
             1043,
         )?));
     }
+
+    let resolved_param_config = resolve_param_config(activation, method.signature())?;
+    let resolved_return_type = resolve_return_type(activation, method.return_type)?;
+
+    let mut seen_exception_indices = HashSet::new();
 
     let mut worklist = vec![0];
 
@@ -104,16 +133,22 @@ pub fn verify_method<'gc>(
                 Err(_) => unreachable!(),
             };
 
-            for exception in body.exceptions.iter() {
-                // If this op is in the to..from and it can throw an error,
-                // add the exception's target to the worklist.
-                if exception.from_offset as i32 <= previous_position
-                    && previous_position < exception.to_offset as i32
-                    && op_can_throw_error(&op)
-                    && !seen_targets.contains(&(exception.target_offset as i32))
-                {
-                    worklist.push(exception.target_offset);
-                    seen_targets.insert(exception.target_offset as i32);
+            if op_can_throw_error(&op) {
+                for (exception_index, exception) in body.exceptions.iter().enumerate() {
+                    // If this op is in the to..from and it can throw an error,
+                    // add the exception's target to the worklist.
+                    if exception.from_offset as i32 <= previous_position
+                        && previous_position < exception.to_offset as i32
+                    {
+                        if !seen_targets.contains(&(exception.target_offset as i32)) {
+                            worklist.push(exception.target_offset);
+                            seen_targets.insert(exception.target_offset as i32);
+                        }
+
+                        // Keep track of all the valid exceptions, and only verify
+                        // them- this is more lenient than avmplus, but still safe.
+                        seen_exception_indices.insert(exception_index);
+                    }
                 }
             }
 
@@ -136,7 +171,10 @@ pub fn verify_method<'gc>(
 
                 let lookedup_target_info = byte_info.get(target_position as usize);
 
-                if matches!(lookedup_target_info, Some(ByteInfo::OpContinue)) {
+                if matches!(
+                    lookedup_target_info,
+                    Some(ByteInfo::OpContinue | ByteInfo::OpStartNonJumpable(_))
+                ) {
                     return Err(make_error_1021(activation));
                 }
 
@@ -274,16 +312,54 @@ pub fn verify_method<'gc>(
                     }
                 }
 
-                AbcOp::GetLex { index } | AbcOp::FindDef { index } => {
+                AbcOp::FindDef { index } => {
                     let multiname = method
                         .translation_unit()
-                        .pool_maybe_uninitialized_multiname(index, &mut activation.context)?;
+                        .pool_maybe_uninitialized_multiname(activation, index)?;
 
                     if multiname.has_lazy_component() {
                         return Err(Error::AvmError(verify_error(
                             activation,
                             "Error #1078: Illegal opcode/multiname combination.",
                             1078,
+                        )?));
+                    }
+                }
+
+                AbcOp::GetLex { index } => {
+                    let multiname = method
+                        .translation_unit()
+                        .pool_maybe_uninitialized_multiname(activation, index)?;
+
+                    if multiname.has_lazy_component() {
+                        return Err(Error::AvmError(verify_error(
+                            activation,
+                            "Error #1078: Illegal opcode/multiname combination.",
+                            1078,
+                        )?));
+                    }
+
+                    // Split this `GetLex` into a `FindPropStrict` and a `GetProperty`.
+                    // A `GetLex` is guaranteed to take up at least 2 bytes. We need
+                    // one byte for the opcode and at least one byte for the multiname
+                    // index. Overwrite the op registered at the opcode byte with a
+                    // `FindPropStrict` op, and register a non-jumpable `GetProperty`
+                    // op at the next byte. This isn't the best way to do it, but it's
+                    // simpler than actually emitting ops and rewriting the jump offsets
+                    // to match.
+                    assert!(bytes_read > 1);
+                    byte_info[previous_position as usize] =
+                        ByteInfo::OpStart(AbcOp::FindPropStrict { index });
+                    byte_info[(previous_position + 1) as usize] =
+                        ByteInfo::OpStartNonJumpable(AbcOp::GetProperty { index });
+                }
+
+                AbcOp::GetOuterScope { index } => {
+                    if activation.outer().get(index as usize).is_none() {
+                        return Err(Error::AvmError(verify_error(
+                            activation,
+                            "Error #1019: Getscopeobject  is out of bounds.",
+                            1019,
                         )?));
                     }
                 }
@@ -295,20 +371,25 @@ pub fn verify_method<'gc>(
                 | AbcOp::Coerce { index: name_index } => {
                     let multiname = method
                         .translation_unit()
-                        .pool_maybe_uninitialized_multiname(name_index, &mut activation.context)?;
+                        .pool_maybe_uninitialized_multiname(activation, name_index)?;
 
                     if multiname.has_lazy_component() {
                         // This matches FP's error message
-                        return Err(make_error_1014(activation, "[]".into()));
+                        return Err(make_error_1014(
+                            activation,
+                            Error1014Type::VerifyError,
+                            "[]".into(),
+                        ));
                     }
 
                     activation
                         .domain()
-                        .get_class(&multiname, activation.context.gc_context)
+                        .get_class(activation.context, &multiname)
                         .ok_or_else(|| {
                             make_error_1014(
                                 activation,
-                                multiname.to_qualified_name(activation.context.gc_context),
+                                Error1014Type::VerifyError,
+                                multiname.to_qualified_name(activation.gc()),
                             )
                         })?;
                 }
@@ -323,20 +404,97 @@ pub fn verify_method<'gc>(
 
     let mut new_code = Vec::new();
     for (i, info) in byte_info.iter().enumerate() {
-        if let ByteInfo::OpStart(c) = info {
+        if let Some(op) = info.get_op() {
             byte_offset_to_idx.insert(i, new_code.len() as i32);
-            new_code.push(c.clone());
+            new_code.push(op.clone());
             idx_to_byte_offset.push(i);
         }
     }
 
-    // Record a list of possible places the code could
-    // jump to- this will be used for optimization.
-    let mut potential_jump_targets = HashSet::new();
+    // Record a target->sources mapping of all jump
+    // targets- this will be used in the optimizer.
+    let mut potential_jump_targets: HashMap<i32, Vec<JumpSource>> = HashMap::new();
 
     // Handle exceptions
     let mut new_exceptions = Vec::new();
-    for exception in body.exceptions.iter() {
+    for (exception_index, exception) in body.exceptions.iter().enumerate() {
+        // Resolve the variable name and target class.
+
+        let target_class = if exception.type_name.0 == 0 {
+            None
+        } else {
+            let pooled_type_name = method
+                .translation_unit()
+                .pool_maybe_uninitialized_multiname(activation, exception.type_name)?;
+
+            if pooled_type_name.has_lazy_component() {
+                // This matches FP's error message
+                return Err(make_error_1014(
+                    activation,
+                    Error1014Type::VerifyError,
+                    "[]".into(),
+                ));
+            }
+
+            let resolved_type = activation
+                .domain()
+                .get_class(activation.context, &pooled_type_name)
+                .ok_or_else(|| {
+                    make_error_1014(
+                        activation,
+                        Error1014Type::VerifyError,
+                        pooled_type_name.to_qualified_name(activation.gc()),
+                    )
+                })?;
+
+            Some(resolved_type)
+        };
+
+        let variable_name = if exception.variable_name.0 == 0 {
+            None
+        } else {
+            let pooled_variable_name = method
+                .translation_unit()
+                .pool_maybe_uninitialized_multiname(activation, exception.variable_name)?;
+
+            // FIXME: avmplus also seems to check the namespace(s)?
+            if pooled_variable_name.has_lazy_component()
+                || pooled_variable_name.is_attribute()
+                || pooled_variable_name.is_any_name()
+            {
+                // This matches FP's error message
+                return Err(make_error_1107(activation));
+            }
+
+            let namespaces = pooled_variable_name.namespace_set();
+
+            if namespaces.is_empty() {
+                // NOTE: avmplus segfaults here
+                panic!("Should have at least one namespace for QName in exception variable name");
+            }
+
+            let name = pooled_variable_name.local_name().expect("Just checked");
+
+            // avmplus uses the first namespace, regardless of how many namespaces there are.
+            Some(QName::new(namespaces[0], name))
+        };
+
+        if !seen_exception_indices.contains(&exception_index) {
+            // We need to push an exception because otherwise `newcatch` ops can try to
+            // read it, but we can give it dummy from/to/target offsets because no code
+            // can actually trigger it (and we might not even have valid offsets anyway).
+            new_exceptions.push(Exception {
+                from_offset: 0,
+                to_offset: 0,
+                target_offset: 0,
+                variable_name,
+                target_class,
+            });
+            continue;
+        }
+
+        // Now resolve the offsets.
+
         // NOTE: This is actually wrong, we should be using the byte offsets in
         // `Activation::handle_err`, not the opcode offsets. avmplus allows for from/to
         // (but not targets) that aren't on a opcode, and some obfuscated SWFs have them.
@@ -379,10 +537,21 @@ pub fn verify_method<'gc>(
             return Err(make_error_1054(activation));
         }
 
-        let new_target_offset = byte_offset_to_idx
+        let maybe_new_target_offset = byte_offset_to_idx
             .get(&(exception.target_offset as usize))
-            .copied()
-            .unwrap_or(0);
+            .copied();
+
+        // The large "NOTE" comment below is also relevant here
+        if let Some(new_target_offset) = maybe_new_target_offset {
+            // If this is a reachable target offset, insert it into the list
+            // of potential jump targets.
+            potential_jump_targets
+                .entry(new_target_offset)
+                .or_default()
+                .push(JumpSource::ExceptionTarget);
+        }
+
+        let new_target_offset = maybe_new_target_offset.unwrap_or(0);
 
         // NOTE: That `unwrap_or` is definitely reachable, e.g. in a case where
         // the target offset is unreachable (see the test "verification"), but it
@@ -399,63 +568,6 @@ pub fn verify_method<'gc>(
             return Err(make_error_1054(activation));
         }
 
-        let target_class = if exception.type_name.0 == 0 {
-            None
-        } else {
-            let pooled_type_name = method
-                .translation_unit()
-                .pool_maybe_uninitialized_multiname(exception.type_name, &mut activation.context)?;
-
-            if pooled_type_name.has_lazy_component() {
-                // This matches FP's error message
-                return Err(make_error_1014(activation, "[]".into()));
-            }
-
-            let resolved_type = activation
-                .domain()
-                .get_class(&pooled_type_name, activation.context.gc_context)
-                .ok_or_else(|| {
-                    make_error_1014(
-                        activation,
-                        pooled_type_name.to_qualified_name(activation.context.gc_context),
-                    )
-                })?;
-
-            Some(resolved_type)
-        };
-
-        let variable_name = if exception.variable_name.0 == 0 {
-            None
-        } else {
-            let pooled_variable_name = method
-                .translation_unit()
-                .pool_maybe_uninitialized_multiname(
-                    exception.variable_name,
-                    &mut activation.context,
-                )?;
-
-            // FIXME: avmplus also seems to check the namespace(s)?
-            if pooled_variable_name.has_lazy_component()
-                || pooled_variable_name.is_attribute()
-                || pooled_variable_name.is_any_name()
-            {
-                // This matches FP's error message
-                return Err(make_error_1107(activation));
-            }
-
-            let namespaces = pooled_variable_name.namespace_set();
-
-            if namespaces.is_empty() {
-                // NOTE: avmplus segfaults here
-                panic!("Should have at least one namespace for QName in exception variable name");
-            }
-
-            let name = pooled_variable_name.local_name().expect("Just checked");
-
-            // avmplus uses the first namespace, regardless of how many namespaces there are.
-            Some(QName::new(namespaces[0], name))
-        };
-
         new_exceptions.push(Exception {
             from_offset: new_from_offset,
             to_offset: new_to_offset,
@@ -471,7 +583,7 @@ pub fn verify_method<'gc>(
         let mut byte_offset = idx_to_byte_offset
             .get(i as usize)
             .copied()
-            .ok_or(make_error_1021(activation))?; // This is still reachable with some weird bytecode, see the `verify_jump_to_middle_of_op` test
+            .ok_or_else(|| make_error_1021(activation))?; // This is still reachable with some weird bytecode, see the `verify_jump_to_middle_of_op` test
 
         if is_jump {
             byte_offset += JUMP_INSTRUCTION_LENGTH;
@@ -481,7 +593,7 @@ pub fn verify_method<'gc>(
         let new_idx = byte_offset_to_idx
             .get(&(new_byte_offset as usize))
             .copied()
-            .ok_or(make_error_1021(activation))?; // See above comment
+            .ok_or_else(|| make_error_1021(activation))?; // See above comment
 
         Ok((new_idx, new_idx - i - 1))
     };
@@ -508,17 +620,29 @@ pub fn verify_method<'gc>(
             | AbcOp::Jump { offset } => {
                 let adjusted_result = adjust_jump_to_idx(i, *offset, true)?;
                 *offset = adjusted_result.1;
-                potential_jump_targets.insert(adjusted_result.0);
+
+                potential_jump_targets
+                    .entry(adjusted_result.0)
+                    .or_default()
+                    .push(JumpSource::JumpFrom(i));
             }
             AbcOp::LookupSwitch(ref mut lookup_switch) => {
                 let adjusted_default = adjust_jump_to_idx(i, lookup_switch.default_offset, false)?;
                 lookup_switch.default_offset = adjusted_default.1;
-                potential_jump_targets.insert(adjusted_default.0);
+
+                potential_jump_targets
+                    .entry(adjusted_default.0)
+                    .or_default()
+                    .push(JumpSource::JumpFrom(i));
 
                 for case in lookup_switch.case_offsets.iter_mut() {
                     let adjusted_case = adjust_jump_to_idx(i, *case, false)?;
                     *case = adjusted_case.1;
-                    potential_jump_targets.insert(adjusted_case.0);
+
+                    potential_jump_targets
+                        .entry(adjusted_case.0)
+                        .or_default()
+                        .push(JumpSource::JumpFrom(i));
                 }
             }
             _ => {}
@@ -532,17 +656,96 @@ pub fn verify_method<'gc>(
         verified_code.push(resolved_op);
     }
 
-    crate::avm2::optimize::optimize(
-        activation,
-        method,
-        &mut verified_code,
-        potential_jump_targets,
-    );
+    if activation.avm2().optimizer_enabled() {
+        crate::avm2::optimize::optimize(
+            activation,
+            method,
+            &mut verified_code,
+            &resolved_param_config,
+            resolved_return_type,
+            &new_exceptions,
+            potential_jump_targets,
+        )?;
+    }
 
     Ok(VerifiedMethodInfo {
         parsed_code: verified_code,
         exceptions: new_exceptions,
+        param_config: resolved_param_config,
+        return_type: resolved_return_type,
     })
+}
+
+pub fn resolve_param_config<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    param_config: &[ParamConfig<'gc>],
+) -> Result<Vec<ResolvedParamConfig<'gc>>, Error<'gc>> {
+    let mut resolved_param_config = Vec::new();
+
+    for param in param_config {
+        let resolved_class = if let Some(param_type_name) = param.param_type_name {
+            if param_type_name.has_lazy_component() {
+                return Err(make_error_1014(
+                    activation,
+                    Error1014Type::VerifyError,
+                    "[]".into(),
+                ));
+            }
+
+            Some(
+                activation
+                    .domain()
+                    .get_class(activation.context, &param_type_name)
+                    .ok_or_else(|| {
+                        make_error_1014(
+                            activation,
+                            Error1014Type::VerifyError,
+                            param_type_name.to_qualified_name(activation.gc()),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        resolved_param_config.push(ResolvedParamConfig {
+            param_name: param.param_name,
+            param_type: resolved_class,
+            default_value: param.default_value,
+        });
+    }
+
+    Ok(resolved_param_config)
+}
+
+fn resolve_return_type<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    return_type: Option<Gc<'gc, Multiname<'gc>>>,
+) -> Result<Option<Class<'gc>>, Error<'gc>> {
+    if let Some(return_type) = return_type {
+        if return_type.has_lazy_component() {
+            return Err(make_error_1014(
+                activation,
+                Error1014Type::VerifyError,
+                "[]".into(),
+            ));
+        }
+
+        Ok(Some(
+            activation
+                .domain()
+                .get_class(activation.context, &return_type)
+                .ok_or_else(|| {
+                    make_error_1014(
+                        activation,
+                        Error1014Type::VerifyError,
+                        return_type.to_qualified_name(activation.gc()),
+                    )
+                })?,
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 // Taken from avmplus's opcodes.tbl
@@ -648,11 +851,9 @@ fn pool_multiname<'gc>(
     translation_unit: TranslationUnit<'gc>,
     index: Index<AbcMultiname>,
 ) -> Result<Gc<'gc, Multiname<'gc>>, Error<'gc>> {
-    if index.0 == 0 {
-        return Err(make_error_1032(activation, 0));
-    }
-
-    translation_unit.pool_maybe_uninitialized_multiname(index, &mut activation.context)
+    // `Multiname::from_abc_index` will do constant pool range checks anyway, so
+    // don't perform an extra one here
+    translation_unit.pool_maybe_uninitialized_multiname(activation, index)
 }
 
 fn pool_string<'gc>(
@@ -664,7 +865,15 @@ fn pool_string<'gc>(
         return Err(make_error_1032(activation, 0));
     }
 
-    translation_unit.pool_string(index.0, &mut activation.borrow_gc())
+    translation_unit.pool_string(index.0, activation.strings())
+}
+
+fn pool_class<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    translation_unit: TranslationUnit<'gc>,
+    index: Index<AbcClass>,
+) -> Result<Class<'gc>, Error<'gc>> {
+    translation_unit.load_class(index.0, activation)
 }
 
 fn resolve_op<'gc>(
@@ -707,7 +916,11 @@ fn resolve_op<'gc>(
         AbcOp::SetLocal { index } => Op::SetLocal { index },
         AbcOp::Kill { index } => Op::Kill { index },
         AbcOp::Call { num_args } => Op::Call { num_args },
-        AbcOp::CallMethod { index, num_args } => Op::CallMethod { index, num_args },
+        AbcOp::CallMethod { index, num_args } => Op::CallMethod {
+            index,
+            num_args,
+            push_return_value: true,
+        },
         AbcOp::CallProperty { index, num_args } => {
             let multiname = pool_multiname(activation, translation_unit, index)?;
 
@@ -716,7 +929,14 @@ fn resolve_op<'gc>(
                 num_args,
             }
         }
-        AbcOp::CallPropLex { index, num_args } => Op::CallPropLex { index, num_args },
+        AbcOp::CallPropLex { index, num_args } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::CallPropLex {
+                multiname,
+                num_args,
+            }
+        }
         AbcOp::CallPropVoid { index, num_args } => {
             let multiname = pool_multiname(activation, translation_unit, index)?;
 
@@ -726,8 +946,22 @@ fn resolve_op<'gc>(
             }
         }
         AbcOp::CallStatic { index, num_args } => Op::CallStatic { index, num_args },
-        AbcOp::CallSuper { index, num_args } => Op::CallSuper { index, num_args },
-        AbcOp::CallSuperVoid { index, num_args } => Op::CallSuperVoid { index, num_args },
+        AbcOp::CallSuper { index, num_args } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::CallSuper {
+                multiname,
+                num_args,
+            }
+        }
+        AbcOp::CallSuperVoid { index, num_args } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::CallSuperVoid {
+                multiname,
+                num_args,
+            }
+        }
         AbcOp::ReturnValue => Op::ReturnValue,
         AbcOp::ReturnVoid => Op::ReturnVoid,
         AbcOp::GetProperty { index } => {
@@ -750,8 +984,16 @@ fn resolve_op<'gc>(
 
             Op::DeleteProperty { multiname }
         }
-        AbcOp::GetSuper { index } => Op::GetSuper { index },
-        AbcOp::SetSuper { index } => Op::SetSuper { index },
+        AbcOp::GetSuper { index } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::GetSuper { multiname }
+        }
+        AbcOp::SetSuper { index } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::SetSuper { multiname }
+        }
         AbcOp::In => Op::In,
         AbcOp::PushScope => Op::PushScope,
         AbcOp::NewCatch { index } => Op::NewCatch { index },
@@ -776,17 +1018,20 @@ fn resolve_op<'gc>(
 
             Op::FindPropStrict { multiname }
         }
-        AbcOp::GetLex { index } => {
-            let multiname = pool_multiname(activation, translation_unit, index)?;
-            // Verifier guarantees that multiname was non-lazy
-
-            Op::GetLex { multiname }
+        AbcOp::GetLex { .. } => {
+            unreachable!("Verifier emits FindPropStrict and GetProperty instead of GetLex")
         }
-        AbcOp::GetDescendants { index } => Op::GetDescendants { index },
-        AbcOp::GetSlot { index } => Op::GetSlot { index },
-        AbcOp::SetSlot { index } => Op::SetSlot { index },
-        AbcOp::GetGlobalSlot { index } => Op::GetGlobalSlot { index },
-        AbcOp::SetGlobalSlot { index } => Op::SetGlobalSlot { index },
+        AbcOp::GetDescendants { index } => {
+            let multiname = pool_multiname(activation, translation_unit, index)?;
+
+            Op::GetDescendants { multiname }
+        }
+        // Turn 1-based representation into 0-based representation
+        AbcOp::GetSlot { index } => Op::GetSlot { index: index - 1 },
+        AbcOp::SetSlot { index } => Op::SetSlot { index: index - 1 },
+        AbcOp::GetGlobalSlot { index } => Op::GetGlobalSlot { index: index - 1 },
+        AbcOp::SetGlobalSlot { index } => Op::SetGlobalSlot { index: index - 1 },
+
         AbcOp::Construct { num_args } => Op::Construct { num_args },
         AbcOp::ConstructProp { index, num_args } => {
             let multiname = pool_multiname(activation, translation_unit, index)?;
@@ -801,7 +1046,10 @@ fn resolve_op<'gc>(
         AbcOp::NewActivation => Op::NewActivation,
         AbcOp::NewObject { num_args } => Op::NewObject { num_args },
         AbcOp::NewFunction { index } => Op::NewFunction { index },
-        AbcOp::NewClass { index } => Op::NewClass { index },
+        AbcOp::NewClass { index } => {
+            let class = pool_class(activation, translation_unit, index)?;
+            Op::NewClass { class }
+        }
         AbcOp::ApplyType { num_types } => Op::ApplyType { num_types },
         AbcOp::NewArray { num_args } => Op::NewArray { num_args },
         AbcOp::CoerceA => Op::CoerceA,
@@ -878,7 +1126,7 @@ fn resolve_op<'gc>(
 
             let class = activation
                 .domain()
-                .get_class(&multiname, activation.context.gc_context)
+                .get_class(activation.context, &multiname)
                 .unwrap();
             // Verifier guarantees that class exists
 
@@ -891,7 +1139,7 @@ fn resolve_op<'gc>(
 
             let class = activation
                 .domain()
-                .get_class(&multiname, activation.context.gc_context)
+                .get_class(activation.context, &multiname)
                 .unwrap();
             // Verifier guarantees that class exists
 
@@ -938,7 +1186,7 @@ fn resolve_op<'gc>(
 
             let class = activation
                 .domain()
-                .get_class(&multiname, activation.context.gc_context)
+                .get_class(activation.context, &multiname)
                 .unwrap();
             // Verifier guarantees that class exists
 

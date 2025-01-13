@@ -6,7 +6,7 @@ import {
     useEffect,
     useState,
 } from "react";
-import { BaseLoadOptions } from "ruffle-core";
+import type { Config } from "ruffle-core";
 
 type SampleCategory = "Animation" | "Game";
 
@@ -20,16 +20,16 @@ export interface DemoSwf {
     title?: string;
     author?: string;
     authorLink?: string;
-    config?: BaseLoadOptions;
+    config?: Config.BaseLoadOptions;
     type: SampleCategory | null;
 }
 
 interface SampleSelectionProperties {
-    sampleSelectionInput: RefObject<HTMLSelectElement>;
+    sampleSelectionInput: RefObject<HTMLSelectElement | null>;
     selectedSample: DemoSwf | null;
     setSelectedSample: (value: DemoSwf | null) => void;
     setSelectedFilename: (name: string | null) => void;
-    onSelectUrl: (url: string, config: BaseLoadOptions) => void;
+    onSelectUrl: (url: string, config: Config.BaseLoadOptions) => void;
 }
 
 export function SampleSelection({

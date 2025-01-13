@@ -9,13 +9,12 @@ use crate::quality::StageQuality;
 use crate::shape_utils::DistilledShape;
 use downcast_rs::{impl_downcast, Downcast};
 use ruffle_wstr::WStr;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 use std::sync::Arc;
-use swf::{self, Color, Rectangle, Twips};
+use swf::{Color, Rectangle, Twips};
 
 pub struct BitmapCacheEntry {
     pub handle: BitmapHandle,
@@ -533,8 +532,9 @@ pub struct ShapeHandle(pub Arc<dyn ShapeHandleImpl>);
 pub trait ShapeHandleImpl: Downcast + Debug {}
 impl_downcast!(ShapeHandleImpl);
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ViewportDimensions {
     /// The dimensions of the stage's containing viewport.
     pub width: u32,

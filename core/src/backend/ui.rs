@@ -1,12 +1,10 @@
 use crate::backend::navigator::OwnedFuture;
-use crate::events::{KeyCode, PlayerEvent, TextControlCode};
 pub use crate::loader::Error as DialogLoaderError;
 use chrono::{DateTime, Utc};
 use downcast_rs::Downcast;
 use fluent_templates::loader::langid;
 pub use fluent_templates::LanguageIdentifier;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use url::Url;
 
 pub type FullscreenError = Cow<'static, str>;
@@ -48,15 +46,14 @@ pub trait FileDialogResult: Downcast {
     fn file_name(&self) -> Option<String>;
     fn size(&self) -> Option<u64>;
     fn file_type(&self) -> Option<String>;
-    fn creator(&self) -> Option<String>;
+    fn creator(&self) -> Option<String> {
+        None
+    }
     fn contents(&self) -> &[u8];
-    /// Write the given data to the chosen file
-    /// This will not necessarily by reflected in future calls to other functions (such as [FileDialogResult::size]),
-    /// until [FileDialogResult::refresh] is called
-    fn write(&self, data: &[u8]);
-    /// Refresh any internal metadata, any future calls to other functions (such as [FileDialogResult::size]) will reflect
+    /// Write the given data to the chosen file and refresh any internal metadata.
+    /// Any future calls to other functions (such as [FileDialogResult::size]) will reflect
     /// the state at the time of the last refresh
-    fn refresh(&mut self);
+    fn write_and_refresh(&mut self, data: &[u8]);
 }
 impl_downcast!(FileDialogResult);
 
@@ -74,6 +71,11 @@ pub trait UiBackend: Downcast {
     /// Get the clipboard content
     fn clipboard_content(&mut self) -> String;
 
+    /// Check if the clipboard is available and not empty
+    fn clipboard_available(&mut self) -> bool {
+        !self.clipboard_content().is_empty()
+    }
+
     /// Sets the clipboard to the given content.
     fn set_clipboard_content(&mut self, content: String);
 
@@ -87,8 +89,9 @@ pub trait UiBackend: Downcast {
     // Unused, but kept in case we need it later.
     fn message(&self, message: &str);
 
-    // Only used on web.
     fn open_virtual_keyboard(&self);
+
+    fn close_virtual_keyboard(&self);
 
     fn language(&self) -> LanguageIdentifier;
 
@@ -99,7 +102,7 @@ pub trait UiBackend: Downcast {
     ///
     /// You may call `register` any amount of times with any amount of found device fonts.
     /// If you do not call `register` with any fonts that match the request,
-    /// then the font will simply be marked as not found - this may or may not fall back to another font.  
+    /// then the font will simply be marked as not found - this may or may not fall back to another font.
     fn load_device_font(
         &self,
         name: &str,
@@ -136,7 +139,7 @@ pub enum MouseCursor {
     /// Equivalent to AS3 `MouseCursor.ARROW`.
     Arrow,
 
-    /// The hand icon incdicating a button or link.
+    /// The hand icon indicating a button or link.
     /// Equivalent to AS3 `MouseCursor.BUTTON`.
     Hand,
 
@@ -147,105 +150,6 @@ pub enum MouseCursor {
     /// The grabby-dragging hand icon.
     /// Equivalent to AS3 `MouseCursor.HAND`.
     Grab,
-}
-
-pub struct InputManager {
-    keys_down: HashSet<KeyCode>,
-    keys_toggled: HashSet<KeyCode>,
-    last_key: KeyCode,
-    last_char: Option<char>,
-    last_text_control: Option<TextControlCode>,
-}
-
-impl InputManager {
-    pub fn new() -> Self {
-        Self {
-            keys_down: HashSet::new(),
-            keys_toggled: HashSet::new(),
-            last_key: KeyCode::Unknown,
-            last_char: None,
-            last_text_control: None,
-        }
-    }
-
-    fn add_key(&mut self, key_code: KeyCode) {
-        self.last_key = key_code;
-        if key_code != KeyCode::Unknown {
-            self.keys_down.insert(key_code);
-        }
-    }
-
-    fn toggle_key(&mut self, key_code: KeyCode) {
-        if key_code == KeyCode::Unknown || self.keys_down.contains(&key_code) {
-            return;
-        }
-        if self.keys_toggled.contains(&key_code) {
-            self.keys_toggled.remove(&key_code);
-        } else {
-            self.keys_toggled.insert(key_code);
-        }
-    }
-
-    fn remove_key(&mut self, key_code: KeyCode) {
-        self.last_key = key_code;
-        if key_code != KeyCode::Unknown {
-            self.keys_down.remove(&key_code);
-        }
-    }
-
-    pub fn handle_event(&mut self, event: &PlayerEvent) {
-        match *event {
-            PlayerEvent::KeyDown { key_code, key_char } => {
-                self.last_char = key_char;
-                self.toggle_key(key_code);
-                self.add_key(key_code);
-            }
-            PlayerEvent::KeyUp { key_code, key_char } => {
-                self.last_char = key_char;
-                self.remove_key(key_code);
-                self.last_text_control = None;
-            }
-            PlayerEvent::TextControl { code } => {
-                self.last_text_control = Some(code);
-            }
-            PlayerEvent::MouseDown { button, .. } => {
-                self.toggle_key(button.into());
-                self.add_key(button.into())
-            }
-            PlayerEvent::MouseUp { button, .. } => self.remove_key(button.into()),
-            _ => {}
-        }
-    }
-
-    pub fn is_key_down(&self, key: KeyCode) -> bool {
-        self.keys_down.contains(&key)
-    }
-
-    pub fn is_key_toggled(&self, key: KeyCode) -> bool {
-        self.keys_toggled.contains(&key)
-    }
-
-    pub fn last_key_code(&self) -> KeyCode {
-        self.last_key
-    }
-
-    pub fn last_key_char(&self) -> Option<char> {
-        self.last_char
-    }
-
-    pub fn last_text_control(&self) -> Option<TextControlCode> {
-        self.last_text_control
-    }
-
-    pub fn is_mouse_down(&self) -> bool {
-        self.is_key_down(KeyCode::MouseLeft)
-    }
-}
-
-impl Default for InputManager {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// UiBackend that does nothing.
@@ -292,6 +196,8 @@ impl UiBackend for NullUiBackend {
     }
 
     fn open_virtual_keyboard(&self) {}
+
+    fn close_virtual_keyboard(&self) {}
 
     fn language(&self) -> LanguageIdentifier {
         US_ENGLISH.clone()
@@ -359,14 +265,9 @@ impl FileDialogResult for NullFileDialogResult {
     fn file_type(&self) -> Option<String> {
         None
     }
-    fn creator(&self) -> Option<String> {
-        None
-    }
-
     fn contents(&self) -> &[u8] {
         &[]
     }
 
-    fn write(&self, _data: &[u8]) {}
-    fn refresh(&mut self) {}
+    fn write_and_refresh(&mut self, _data: &[u8]) {}
 }

@@ -12,6 +12,8 @@ members = [
     "scanner",
     "exporter",
 
+    "frontend-utils",
+
     "render",
     "render/canvas",
     "render/naga-agal",
@@ -24,6 +26,7 @@ members = [
 
     "video",
     "video/software",
+    "video/external",
 
     "tests",
     "tests/input-format",
@@ -43,15 +46,37 @@ repository = "https://github.com/ruffle-rs/ruffle"
 version = "0.1.0"
 
 [workspace.dependencies]
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-naga = { version = "0.19.2", features = ["wgsl-out"] }
-naga_oil = "0.13.0"
-wgpu = "0.19.3"
-egui = "0.26.2"
-clap = { version = "4.5.2", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+naga = { version = "23.1.0", features = ["wgsl-out"] }
+wgpu = "23.0.1"
+egui = "0.30.0"
+clap = { version = "4.5.23", features = ["derive"] }
+cpal = "0.15.3"
 anyhow = "1.0"
 slotmap = "1.0.7"
+async-channel = "2.3.1"
+bitflags = "2.6.0"
+bytemuck = "1.21.0"
+chrono = { version = "0.4.39", default-features = false }
+enum-map = "2.7.3"
+flate2 = "1.0.35"
+futures = "0.3.31"
+image = { version = "0.25.5", default-features = false }
+js-sys = "0.3.77"
+web-sys = "0.3.77"
+log = "0.4"
+num-derive = "0.4.2"
+num-traits = "0.2.19"
+serde = "1.0.217"
+thiserror = "2.0.9"
+url = "2.5.2"
+# Make sure to match wasm-bindgen-cli version to this everywhere.
+wasm-bindgen = "=0.2.100"
+walkdir = "2.5.0"
+tokio = "1.42.0"
+# Switching from the `async-std` to the `tokio` runtime, which we depend on anyway.
+rfd = { version = "0.15.2", default-features = false, features = ["tokio", "xdg-portal"] }
 
 [workspace.lints.rust]
 # Clippy nightly often adds new/buggy lints that we want to ignore.
@@ -61,8 +86,11 @@ unknown_lints = "allow"
 
 [workspace.lints.clippy]
 # LONG-TERM: These lints are unhelpful.
-manual_map = "allow"             # Less readable: Suggests `opt.map(..)` instsead of `if let Some(opt) { .. }`
+manual_map = "allow"             # Less readable: Suggests `opt.map(..)` instead of `if let Some(opt) { .. }`
 manual_range_contains = "allow"  # Less readable: Suggests `(a..b).contains(n)` instead of `n >= a && n < b`
+assigning_clones = "allow"       # Sometimes useful, but more often than not it doesn't do anything as
+                                 # we overwrite an empty item. And sometimes it can even be a footgun
+                                 # by keeping big allocations alive.
 
 # Don't optimize build scripts and macros.
 [profile.release.build-override]

@@ -1,22 +1,20 @@
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
-use crate::avm2::value::Value;
 use crate::avm2::{Activation, Error};
 use crate::backend::ui::FileDialogResult;
-use gc_arena::barrier::unlock;
-use gc_arena::{lock::RefLock, Collect, Gc};
-use gc_arena::{GcWeak, Mutation};
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use gc_arena::GcWeak;
+use gc_arena::{Collect, Gc};
+use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 
 pub fn file_reference_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class).into();
+    let base = ScriptObjectData::new(class);
 
     Ok(FileReferenceObject(Gc::new(
-        activation.context.gc(),
+        activation.gc(),
         FileReferenceObjectData {
             base,
             reference: RefCell::new(FileReference::None),
@@ -35,20 +33,16 @@ pub struct FileReferenceObject<'gc>(pub Gc<'gc, FileReferenceObjectData<'gc>>);
 pub struct FileReferenceObjectWeak<'gc>(pub GcWeak<'gc, FileReferenceObjectData<'gc>>);
 
 impl<'gc> TObject<'gc> for FileReferenceObject<'gc> {
-    fn base(&self) -> Ref<ScriptObjectData<'gc>> {
-        self.0.base.borrow()
-    }
+    fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
+        // SAFETY: Object data is repr(C), and a compile-time assert ensures
+        // that the ScriptObjectData stays at offset 0 of the struct- so the
+        // layouts are compatible
 
-    fn base_mut(&self, mc: &Mutation<'gc>) -> RefMut<ScriptObjectData<'gc>> {
-        unlock!(Gc::write(mc, self.0), FileReferenceObjectData, base).borrow_mut()
+        unsafe { Gc::cast(self.0) }
     }
 
     fn as_ptr(&self) -> *const ObjectPtr {
         Gc::as_ptr(self.0) as *const ObjectPtr
-    }
-
-    fn value_of(&self, _mc: &Mutation<'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(Value::Object(Object::from(*self)))
     }
 
     fn as_file_reference(&self) -> Option<FileReferenceObject<'gc>> {
@@ -56,7 +50,7 @@ impl<'gc> TObject<'gc> for FileReferenceObject<'gc> {
     }
 }
 
-impl<'gc> FileReferenceObject<'gc> {
+impl FileReferenceObject<'_> {
     pub fn init_from_dialog_result(&self, result: Box<dyn FileDialogResult>) -> FileReference {
         self.0
             .reference
@@ -83,14 +77,20 @@ pub enum FileReference {
 
 #[derive(Collect)]
 #[collect(no_drop)]
+#[repr(C, align(8))]
 pub struct FileReferenceObjectData<'gc> {
     /// Base script object
-    base: RefLock<ScriptObjectData<'gc>>,
+    base: ScriptObjectData<'gc>,
 
     reference: RefCell<FileReference>,
 
     loaded: Cell<bool>,
 }
+
+const _: () = assert!(std::mem::offset_of!(FileReferenceObjectData, base) == 0);
+const _: () = assert!(
+    std::mem::align_of::<FileReferenceObjectData>() == std::mem::align_of::<ScriptObjectData>()
+);
 
 impl fmt::Debug for FileReferenceObject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

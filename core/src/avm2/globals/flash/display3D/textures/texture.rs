@@ -52,7 +52,7 @@ pub fn do_copy<'gc>(
                 .collect();
 
             let bitmap_data = BitmapData::new_with_pixels(width, height, true, colors);
-            BitmapDataWrapper::new(GcCell::new(activation.context.gc_context, bitmap_data))
+            BitmapDataWrapper::new(GcCell::new(activation.gc(), bitmap_data))
         }
         _ => {
             tracing::warn!(
@@ -72,9 +72,11 @@ pub fn do_copy<'gc>(
 
 pub fn upload_compressed_texture_from_byte_array_internal<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    this: Object<'gc>,
+    this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
     let texture = this.as_texture().unwrap();
     let data = args.get_object(activation, 0, "data")?;
     let byte_array_offset = args.get_u32(activation, 1)? as usize;
@@ -99,9 +101,11 @@ pub fn upload_compressed_texture_from_byte_array_internal<'gc>(
 
 pub fn upload_from_byte_array<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    this: Object<'gc>,
+    this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
     let texture = this.as_texture().unwrap();
     let data = args.get_object(activation, 0, "data")?;
     let byte_array_offset = args.get_u32(activation, 1)?;
@@ -113,11 +117,15 @@ pub fn upload_from_byte_array<'gc>(
 
 pub fn upload_from_bitmap_data<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    this: Object<'gc>,
+    this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
     if let Some(texture) = this.as_texture() {
-        if let Some(source) = args[0].coerce_to_object(activation)?.as_bitmap_data() {
+        let source_obj = args.get_object(activation, 0, "source")?;
+
+        if let Some(source) = source_obj.as_bitmap_data() {
             let mip_level = args[1].coerce_to_u32(activation)?;
             if mip_level == 0 {
                 texture.context3d().copy_bitmapdata_to_texture(

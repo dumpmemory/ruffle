@@ -1,11 +1,10 @@
 use crate::avm2::class::Class;
 use crate::avm2::multiname::Multiname;
+use crate::avm2::script::Script;
 use crate::string::AvmAtom;
 
-use gc_arena::{Collect, Gc, GcCell};
-use swf::avm2::types::{
-    Class as AbcClass, Exception, Index, LookupSwitch, Method, Multiname as AbcMultiname, Namespace,
-};
+use gc_arena::{Collect, Gc};
+use swf::avm2::types::{Exception, Index, LookupSwitch, Method, Namespace};
 
 #[derive(Clone, Collect, Debug)]
 #[collect(no_drop)]
@@ -16,7 +15,7 @@ pub enum Op<'gc> {
         num_types: u32,
     },
     AsType {
-        class: GcCell<'gc, Class<'gc>>,
+        class: Class<'gc>,
     },
     AsTypeLate,
     BitAnd,
@@ -32,8 +31,8 @@ pub enum Op<'gc> {
     },
     CallMethod {
         index: u32,
-
         num_args: u32,
+        push_return_value: bool,
     },
     CallProperty {
         multiname: Gc<'gc, Multiname<'gc>>,
@@ -41,8 +40,7 @@ pub enum Op<'gc> {
         num_args: u32,
     },
     CallPropLex {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
 
         num_args: u32,
     },
@@ -58,28 +56,32 @@ pub enum Op<'gc> {
         num_args: u32,
     },
     CallSuper {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
 
         num_args: u32,
     },
     CallSuperVoid {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
 
         num_args: u32,
     },
     CheckFilter,
     Coerce {
-        class: GcCell<'gc, Class<'gc>>,
+        class: Class<'gc>,
+    },
+    CoerceSwapPop {
+        class: Class<'gc>,
     },
     CoerceA,
     CoerceB,
     CoerceD,
+    CoerceDSwapPop,
     CoerceI,
+    CoerceISwapPop,
     CoerceO,
     CoerceS,
     CoerceU,
+    CoerceUSwapPop,
     Construct {
         num_args: u32,
     },
@@ -133,15 +135,12 @@ pub enum Op<'gc> {
         multiname: Gc<'gc, Multiname<'gc>>,
     },
     GetDescendants {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     },
     GetGlobalScope,
     GetGlobalSlot {
+        // note: 0-indexed, as opposed to FP.
         index: u32,
-    },
-    GetLex {
-        multiname: Gc<'gc, Multiname<'gc>>,
     },
     GetLocal {
         index: u32,
@@ -155,12 +154,15 @@ pub enum Op<'gc> {
     GetScopeObject {
         index: u8,
     },
+    GetScriptGlobals {
+        script: Script<'gc>,
+    },
     GetSlot {
+        // note: 0-indexed, as opposed to FP.
         index: u32,
     },
     GetSuper {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     },
     GreaterEquals,
     GreaterThan,
@@ -225,7 +227,7 @@ pub enum Op<'gc> {
     },
     InstanceOf,
     IsType {
-        class: GcCell<'gc, Class<'gc>>,
+        class: Class<'gc>,
     },
     IsTypeLate,
     Jump {
@@ -257,8 +259,7 @@ pub enum Op<'gc> {
         index: Index<Exception>,
     },
     NewClass {
-        #[collect(require_static)]
-        index: Index<AbcClass>,
+        class: Class<'gc>,
     },
     NewFunction {
         #[collect(require_static)]
@@ -303,9 +304,11 @@ pub enum Op<'gc> {
     PushUndefined,
     PushWith,
     ReturnValue,
+    ReturnValueNoCoerce,
     ReturnVoid,
     RShift,
     SetGlobalSlot {
+        // note: 0-indexed, as opposed to FP.
         index: u32,
     },
     SetLocal {
@@ -315,11 +318,15 @@ pub enum Op<'gc> {
         multiname: Gc<'gc, Multiname<'gc>>,
     },
     SetSlot {
+        // note: 0-indexed, as opposed to FP.
+        index: u32,
+    },
+    SetSlotNoCoerce {
+        // note: 0-indexed, as opposed to FP.
         index: u32,
     },
     SetSuper {
-        #[collect(require_static)]
-        index: Index<AbcMultiname>,
+        multiname: Gc<'gc, Multiname<'gc>>,
     },
     Sf32,
     Sf64,
@@ -337,6 +344,62 @@ pub enum Op<'gc> {
     TypeOf,
     Timestamp,
     URShift,
+}
+
+impl Op<'_> {
+    pub fn is_block_terminating(&self) -> bool {
+        matches!(
+            self,
+            Op::Jump { .. }
+                | Op::LookupSwitch { .. }
+                | Op::ReturnValue
+                | Op::ReturnValueNoCoerce
+                | Op::ReturnVoid
+                | Op::Throw
+        )
+    }
+
+    pub fn can_throw_error(&self) -> bool {
+        !matches!(
+            self,
+            Op::Bkpt
+                | Op::BkptLine { .. }
+                | Op::Timestamp
+                | Op::PushByte { .. }
+                | Op::PushDouble { .. }
+                | Op::PushFalse
+                | Op::PushInt { .. }
+                | Op::PushNamespace { .. }
+                | Op::PushNaN
+                | Op::PushNull
+                | Op::PushShort { .. }
+                | Op::PushString { .. }
+                | Op::PushTrue
+                | Op::PushUint { .. }
+                | Op::PushUndefined
+                | Op::Dup
+                | Op::Swap
+                | Op::Pop
+                | Op::TypeOf
+                | Op::GetGlobalScope
+                | Op::GetScopeObject { .. }
+                | Op::GetOuterScope { .. }
+                | Op::GetGlobalSlot { .. }
+                | Op::GetLocal { .. }
+                | Op::SetLocal { .. }
+                | Op::Kill { .. }
+                | Op::Jump { .. }
+                | Op::IfTrue { .. }
+                | Op::IfFalse { .. }
+                | Op::IfStrictEq { .. }
+                | Op::IfStrictNe { .. }
+                | Op::LookupSwitch { .. }
+                | Op::Nop
+                | Op::Not
+                | Op::PopScope
+                | Op::ReturnVoid
+        )
+    }
 }
 
 #[cfg(target_pointer_width = "64")]

@@ -40,8 +40,7 @@ impl LehmerRng {
 /// unmultiplied values. Make sure to convert the color to the correct form beforehand.
 // TODO: Maybe split the type into `PremultipliedColor(u32)` and
 //   `UnmultipliedColor(u32)`?
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Collect)]
-#[collect(no_drop)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Color(u32);
 
 #[derive(Debug, Clone)]
@@ -197,7 +196,9 @@ bitflags! {
 #[collect(no_drop)]
 pub struct BitmapData<'gc> {
     /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
+    #[collect(require_static)]
     pixels: Vec<Color>,
+
     width: u32,
     height: u32,
     transparency: bool,
@@ -223,11 +224,17 @@ pub struct BitmapData<'gc> {
     /// A list of display objects that are backed by this BitmapData
     display_objects: Vec<DisplayObjectWeak<'gc>>,
 
+    #[collect(require_static)]
     dirty_state: DirtyState,
+
+    /// Holds an egui texture handle, used for rendering this Bitmap in the debug ui.
+    /// This is automatically set to `None` when the texture is updated (either from
+    /// marking the CPU side dirty, or from performing a GPU -> CPU sync).
+    #[cfg(feature = "egui")]
+    pub egui_texture: std::cell::RefCell<Option<egui::TextureHandle>>,
 }
 
-#[derive(Clone, Collect, Debug)]
-#[collect(require_static)]
+#[derive(Clone, Debug)]
 enum DirtyState {
     // Both the CPU and GPU pixels are up to date. We do not need to wait for any syncs to complete
     Clean,
@@ -305,6 +312,8 @@ mod wrapper {
                     avm2_object: None,
                     display_objects: vec![],
                     dirty_state: DirtyState::Clean,
+                    #[cfg(feature = "egui")]
+                    egui_texture: Default::default(),
                 },
             ))
         }
@@ -327,6 +336,8 @@ mod wrapper {
                 display_objects: vec![],
                 // We have no GPU texture, so there's no need to mark as dirty
                 dirty_state: DirtyState::Clean,
+                #[cfg(feature = "egui")]
+                egui_texture: Default::default(),
             }
         }
 
@@ -348,7 +359,9 @@ mod wrapper {
                             }),
                         )
                         .expect("Failed to sync BitmapData");
-                    write.dirty_state = DirtyState::Clean
+                    write.dirty_state = DirtyState::Clean;
+                    #[cfg(feature = "egui")]
+                    write.egui_texture.borrow_mut().take();
                 }
                 old_state => write.dirty_state = old_state,
             }
@@ -388,6 +401,8 @@ mod wrapper {
                 }
                 DirtyState::CpuModified(_) | DirtyState::Clean => None,
             };
+            #[cfg(feature = "egui")]
+            write.egui_texture.borrow_mut().take();
             (self.0, dirty_rect)
         }
 
@@ -477,7 +492,7 @@ mod wrapper {
             context: &mut RenderContext<'_, 'gc>,
             pixel_snapping: PixelSnapping,
         ) {
-            let mut inner_bitmap_data = self.0.write(context.gc_context);
+            let mut inner_bitmap_data = self.0.write(context.gc());
             if inner_bitmap_data.disposed() {
                 return;
             }
@@ -560,6 +575,8 @@ impl<'gc> BitmapData<'gc> {
             avm2_object: None,
             display_objects: vec![],
             dirty_state: DirtyState::Clean,
+            #[cfg(feature = "egui")]
+            egui_texture: Default::default(),
         }
     }
 
@@ -579,6 +596,8 @@ impl<'gc> BitmapData<'gc> {
             disposed: false,
             dirty_state: DirtyState::Clean,
             display_objects: vec![],
+            #[cfg(feature = "egui")]
+            egui_texture: Default::default(),
         }
     }
 
@@ -607,6 +626,8 @@ impl<'gc> BitmapData<'gc> {
             let bitmap_handle = renderer.register_bitmap(bitmap);
             if let Err(e) = &bitmap_handle {
                 tracing::warn!("Failed to register raw bitmap for BitmapData: {:?}", e);
+            } else {
+                self.dirty_state = DirtyState::Clean;
             }
             self.bitmap_handle = bitmap_handle.ok();
         }
@@ -631,6 +652,10 @@ impl<'gc> BitmapData<'gc> {
     pub fn set_cpu_dirty(&mut self, gc_context: &Mutation<'gc>, region: PixelRegion) {
         debug_assert!(region.x_max <= self.width);
         debug_assert!(region.y_max <= self.height);
+
+        #[cfg(feature = "egui")]
+        self.egui_texture.borrow_mut().take();
+
         let inform_changes = match &mut self.dirty_state {
             DirtyState::CpuModified(old_region) => {
                 old_region.union(region);
@@ -685,6 +710,19 @@ impl<'gc> BitmapData<'gc> {
     #[inline]
     pub fn set_pixel32_raw(&mut self, x: u32, y: u32, color: Color) {
         self.pixels[(x + y * self.width) as usize] = color;
+    }
+
+    #[inline]
+    pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
+        let p1 = (x1 + y * self.width) as usize;
+        let p2 = (x2 + y * self.width) as usize;
+        let slice = &mut self.pixels[p1..p2];
+        slice.fill(color);
+    }
+
+    #[inline]
+    pub fn fill(&mut self, color: Color) {
+        self.pixels.fill(color);
     }
 
     #[inline]

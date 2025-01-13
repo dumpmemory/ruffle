@@ -119,8 +119,9 @@ impl GlowFilter {
                     layout: Some(&self.pipeline_layout),
                     vertex: wgpu::VertexState {
                         module: &descriptors.shaders.glow_filter,
-                        entry_point: "main_vertex",
+                        entry_point: Some("main_vertex"),
                         buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS_WITH_BLUR,
+                        compilation_options: Default::default(),
                     },
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -139,10 +140,12 @@ impl GlowFilter {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &descriptors.shaders.glow_filter,
-                        entry_point: "main_fragment",
+                        entry_point: Some("main_fragment"),
                         targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        compilation_options: Default::default(),
                     }),
                     multiview: None,
+                    cache: None,
                 })
         })
     }

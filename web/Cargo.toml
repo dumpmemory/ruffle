@@ -33,9 +33,9 @@ profiling = []
 [dependencies]
 console_error_panic_hook = { version = "0.1.7", optional = true }
 slotmap = { workspace = true }
-js-sys = "0.3.69"
+js-sys = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
-tracing-subscriber = { version = "0.3.18", default-features = false, features = ["registry"] }
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["registry"] }
 tracing-log = "0.2.0"
 tracing-wasm = "0.2.1"
 ruffle_render_canvas = { path = "../render/canvas", optional = true }
@@ -44,33 +44,41 @@ ruffle_render = { path = "../render" }
 ruffle_render_webgl = { path = "../render/webgl", optional = true }
 ruffle_render_wgpu = { path = "../render/wgpu", optional = true }
 ruffle_video_software = { path = "../video/software" }
-url = "2.5.0"
-wasm-bindgen = "=0.2.92"
-wasm-bindgen-futures = "0.4.42"
+url = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4.50"
 serde-wasm-bindgen = "0.6.5"
-chrono = { version = "0.4", default-features = false, features = ["wasmbind", "clock"] }
+chrono = { workspace = true, features = ["wasmbind", "clock"] }
 getrandom = { version = "0.2", features = ["js"] }
-serde = { version = "1.0.197", features = ["derive"] }
-thiserror = "1.0"
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
 base64 = "0.22.0"
-async-channel = "2.2.0"
+async-channel = { workspace = true }
 futures-util = { version = "0.3.30", features = ["sink"] }
-gloo-net =  { version = "0.5.0", default-features = false, features = ["websocket"] }
-rfd = { version = "0.14.0", features = ["file-handle-inner"] }
-wasm-streams = "0.4.0"
-futures = "0.3.30"
+gloo-net =  { version = "0.6.0", default-features = false, features = ["websocket"] }
+rfd = { workspace = true, features = ["file-handle-inner"] }
+wasm-streams = "0.4.2"
+futures = { workspace = true }
+zip = { version = "2.2.2", default-features = false}
 
 [dependencies.ruffle_core]
 path = "../core"
-features = ["audio", "mp3", "nellymoser", "default_compatibility_rules", "default_font"]
+features = ["audio", "mp3", "aac", "nellymoser", "default_compatibility_rules", "default_font", "serde"]
 
 [dependencies.web-sys]
-version = "0.3.69"
+workspace = true
 features = [
     "AddEventListenerOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioContext",
     "AudioDestinationNode", "AudioNode", "AudioParam", "Blob", "BlobPropertyBag",
     "ChannelMergerNode", "ChannelSplitterNode", "ClipboardEvent", "DataTransfer", "Element", "Event",
     "EventTarget", "GainNode", "Headers", "HtmlCanvasElement", "HtmlDocument", "HtmlElement", "HtmlFormElement",
     "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Location", "PointerEvent",
-    "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials"
+    "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials",
+    "Url", "Clipboard", "FocusEvent", "ShadowRoot"
+]
+
+[package.metadata.cargo-machete]
+ignored = [
+    # Not used directly, declared only to enable its `js` feature.
+    "getrandom"
 ]

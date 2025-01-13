@@ -12,8 +12,8 @@ use crate::bitmap::bitmap_data::{BitmapDataDrawError, IBitmapDrawable};
 use crate::bitmap::bitmap_data::{ChannelOptions, ThresholdOperation};
 use crate::bitmap::{is_size_valid, operations};
 use crate::character::Character;
-use crate::context::GcContext;
 use crate::display_object::DisplayObject;
+use crate::string::StringContext;
 use crate::swf::BlendMode;
 use crate::{avm1_stub, avm_error};
 use gc_arena::{GcCell, Mutation};
@@ -105,9 +105,9 @@ fn constructor<'gc>(
 
     let bitmap_data = BitmapData::new(width, height, transparency, fill_color);
     this.set_native(
-        activation.context.gc_context,
+        activation.gc(),
         NativeObject::BitmapData(BitmapDataWrapper::new(GcCell::new(
-            activation.context.gc_context,
+            activation.gc(),
             bitmap_data,
         ))),
     );
@@ -237,7 +237,7 @@ fn set_pixel<'gc>(
                 let color = color_val.coerce_to_u32(activation)?;
 
                 operations::set_pixel(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     x,
@@ -268,7 +268,7 @@ fn set_pixel32<'gc>(
                 let color = color_val.coerce_to_u32(activation)?;
 
                 operations::set_pixel32(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     x,
@@ -335,7 +335,7 @@ fn copy_channel<'gc>(
                     .coerce_to_i32(activation)?;
 
                 operations::copy_channel(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     (min_x, min_y),
@@ -378,7 +378,7 @@ fn fill_rect<'gc>(
                     .coerce_to_i32(activation)?;
 
                 operations::fill_rect(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     x,
@@ -403,7 +403,7 @@ fn clone<'gc>(
     if let NativeObject::BitmapData(bitmap_data) = this.native() {
         if !bitmap_data.disposed() {
             return Ok(new_bitmap_data(
-                activation.context.gc_context,
+                activation.gc(),
                 this.get_local_stored("__proto__", activation, false),
                 bitmap_data.clone_data(activation.context.renderer),
             )
@@ -421,7 +421,7 @@ fn dispose<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let NativeObject::BitmapData(bitmap_data) = this.native() {
         if !bitmap_data.disposed() {
-            bitmap_data.dispose(activation.context.gc_context);
+            bitmap_data.dispose(activation.gc());
             return Ok(Value::Undefined);
         }
     }
@@ -444,7 +444,7 @@ fn flood_fill<'gc>(
                 let color = color_val.coerce_to_u32(activation)?;
 
                 operations::flood_fill(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     x,
@@ -487,7 +487,7 @@ fn noise<'gc>(
             if let Some(random_seed_val) = args.get(0) {
                 let random_seed = random_seed_val.coerce_to_i32(activation)?;
                 operations::noise(
-                    activation.context.gc_context,
+                    activation.gc(),
                     bitmap_data,
                     random_seed,
                     low,
@@ -562,7 +562,7 @@ fn draw<'gc>(
             // if we're actually going to draw something.
             let quality = activation.context.stage.quality();
             match operations::draw(
-                &mut activation.context,
+                activation.context,
                 bitmap_data,
                 source,
                 Transform {
@@ -640,11 +640,11 @@ fn apply_filter<'gc>(
                 .get(3)
                 .unwrap_or(&Value::Undefined)
                 .coerce_to_object(activation);
-            let filter = bitmap_filter::avm1_to_filter(filter_object, &mut activation.context);
+            let filter = bitmap_filter::avm1_to_filter(filter_object, activation.context);
 
             if let Some(filter) = filter {
                 operations::apply_filter(
-                    &mut activation.context,
+                    activation.context,
                     bitmap_data,
                     source,
                     (src_min_x, src_min_y),
@@ -705,7 +705,7 @@ fn color_transform<'gc>(
                 };
 
                 operations::color_transform(
-                    activation.context.gc_context,
+                    activation.gc(),
                     activation.context.renderer,
                     bitmap_data,
                     x_min,
@@ -815,7 +815,7 @@ fn perlin_noise<'gc>(
             let octave_offsets = octave_offsets?;
 
             operations::perlin_noise(
-                activation.context.gc_context,
+                activation.gc(),
                 bitmap_data,
                 (base_x, base_y),
                 num_octaves,
@@ -1028,7 +1028,7 @@ fn copy_pixels<'gc>(
                                 as i32;
 
                             operations::copy_pixels_with_alpha_source(
-                                &mut activation.context,
+                                activation.context,
                                 bitmap_data,
                                 src_bitmap,
                                 (src_min_x, src_min_y, src_width, src_height),
@@ -1040,7 +1040,7 @@ fn copy_pixels<'gc>(
                         }
                     } else {
                         operations::copy_pixels(
-                            &mut activation.context,
+                            activation.context,
                             bitmap_data,
                             src_bitmap,
                             (src_min_x, src_min_y, src_width, src_height),
@@ -1121,7 +1121,7 @@ fn merge<'gc>(
             if let NativeObject::BitmapData(src_bitmap) = source_bitmap.native() {
                 if !src_bitmap.disposed() {
                     operations::merge(
-                        activation.context.gc_context,
+                        activation.gc(),
                         activation.context.renderer,
                         bitmap_data,
                         src_bitmap,
@@ -1201,7 +1201,7 @@ fn palette_map<'gc>(
             if let NativeObject::BitmapData(src_bitmap) = source_bitmap.native() {
                 if !src_bitmap.disposed() {
                     operations::palette_map(
-                        activation.context.gc_context,
+                        activation.gc(),
                         activation.context.renderer,
                         bitmap_data,
                         src_bitmap,
@@ -1279,7 +1279,7 @@ fn pixel_dissolve<'gc>(
                     };
 
                     return Ok(operations::pixel_dissolve(
-                        activation.context.gc_context,
+                        activation.gc(),
                         activation.context.renderer,
                         bitmap_data,
                         src_bitmap_data,
@@ -1315,7 +1315,7 @@ fn scroll<'gc>(
                 .coerce_to_i32(activation)?;
 
             operations::scroll(
-                activation.context.gc_context,
+                activation.gc(),
                 activation.context.renderer,
                 bitmap_data,
                 x,
@@ -1397,7 +1397,7 @@ fn threshold<'gc>(
             if let NativeObject::BitmapData(src_bitmap) = source_bitmap.native() {
                 if !src_bitmap.disposed() {
                     let modified_count = operations::threshold(
-                        activation.context.gc_context,
+                        activation.gc(),
                         activation.context.renderer,
                         bitmap_data,
                         src_bitmap,
@@ -1469,7 +1469,7 @@ fn compare<'gc>(
         other_bitmap_data,
     ) {
         Some(bitmap_data) => Ok(new_bitmap_data(
-            activation.context.gc_context,
+            activation.gc(),
             this.get_local_stored("__proto__", activation, false),
             bitmap_data,
         )
@@ -1514,7 +1514,7 @@ fn load_bitmap<'gc>(
             .collect(),
     );
     Ok(new_bitmap_data(
-        activation.context.gc_context,
+        activation.gc(),
         this.get_local_stored("prototype", activation, false),
         bitmap_data,
     )
@@ -1522,14 +1522,14 @@ fn load_bitmap<'gc>(
 }
 
 pub fn create_constructor<'gc>(
-    context: &mut GcContext<'_, 'gc>,
+    context: &mut StringContext<'gc>,
     proto: ScriptObject<'gc>,
     fn_proto: Object<'gc>,
 ) -> Object<'gc> {
     define_properties_on(PROTO_DECLS, context, proto, fn_proto);
 
     let bitmap_data_constructor = FunctionObject::constructor(
-        context.gc_context,
+        context.gc(),
         Executable::Native(constructor),
         constructor_to_fn!(constructor),
         fn_proto,

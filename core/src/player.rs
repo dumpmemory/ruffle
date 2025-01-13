@@ -1,4 +1,3 @@
-use crate::avm1::globals::system::SandboxType;
 use crate::avm1::Attribute;
 use crate::avm1::Avm1;
 use crate::avm1::Object;
@@ -6,20 +5,17 @@ use crate::avm1::SystemProperties;
 use crate::avm1::VariableDumper;
 use crate::avm1::{Activation, ActivationIdentifier};
 use crate::avm1::{TObject, Value};
-use crate::avm2::{
-    object::TObject as _, Activation as Avm2Activation, Avm2, CallStack, Object as Avm2Object,
-};
+use crate::avm2::{Activation as Avm2Activation, Avm2, CallStack, Object as Avm2Object};
 use crate::backend::ui::FontDefinition;
 use crate::backend::{
     audio::{AudioBackend, AudioManager},
     log::LogBackend,
     navigator::{NavigatorBackend, Request},
     storage::StorageBackend,
-    ui::{InputManager, MouseCursor, UiBackend},
+    ui::{MouseCursor, UiBackend},
 };
 use crate::compatibility_rules::CompatibilityRules;
 use crate::config::Letterbox;
-use crate::context::GcContext;
 use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
 use crate::context_menu::{
     BuiltInItemFlags, ContextMenuCallback, ContextMenuItem, ContextMenuState,
@@ -33,8 +29,9 @@ use crate::events::GamepadButton;
 use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult, KeyCode, MouseButton, PlayerEvent};
 use crate::external::{ExternalInterface, ExternalInterfaceProvider, NullFsCommandProvider};
 use crate::external::{FsCommandProvider, Value as ExternalValue};
-use crate::focus_tracker::FocusTracker;
+use crate::focus_tracker::NavigationDirection;
 use crate::frame_lifecycle::{run_all_phases_avm2, FramePhase};
+use crate::input::InputManager;
 use crate::library::Library;
 use crate::limits::ExecutionLimit;
 use crate::loader::{LoadBehavior, LoadManager};
@@ -44,23 +41,24 @@ use crate::net_connection::NetConnections;
 use crate::prelude::*;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
+use crate::string::StringContext;
 use crate::string::{AvmString, AvmStringInterner};
 use crate::stub::StubCollection;
 use crate::tag_utils::SwfMovie;
 use crate::timer::Timers;
 use crate::vminterface::Instantiator;
 use crate::DefaultFont;
-use gc_arena::{Collect, DynamicRootSet, GcCell, Rootable};
+use gc_arena::lock::GcRefLock;
+use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use rand::{rngs::SmallRng, SeedableRng};
 use ruffle_render::backend::{null::NullRenderer, RenderBackend, ViewportDimensions};
 use ruffle_render::commands::CommandList;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::TransformStack;
 use ruffle_video::backend::VideoBackend;
-use serde::Deserialize;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::ops::DerefMut;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak as RcWeak};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
@@ -73,19 +71,13 @@ use web_time::Instant;
 pub const NEWEST_PLAYER_VERSION: u8 = 32;
 
 #[cfg(feature = "default_font")]
-pub const FALLBACK_DEVICE_FONT_TAG: &[u8] = include_bytes!("../assets/noto-sans-definefont3.bin");
+pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans-regular.subset.ttf.gz");
 
 #[derive(Collect)]
 #[collect(no_drop)]
 struct GcRoot<'gc> {
-    callstack: GcCell<'gc, GcCallstack<'gc>>,
-    data: GcCell<'gc, GcRootData<'gc>>,
-}
-
-#[derive(Collect, Default)]
-#[collect(no_drop)]
-struct GcCallstack<'gc> {
-    avm2: Option<GcCell<'gc, CallStack<'gc>>>,
+    avm2_callstack: GcRefLock<'gc, CallStack<'gc>>,
+    data: GcRefLock<'gc, GcRootData<'gc>>,
 }
 
 #[derive(Clone)]
@@ -98,15 +90,44 @@ impl StaticCallstack {
         if let Some(arena) = self.arena.upgrade() {
             if let Ok(arena) = arena.try_borrow() {
                 arena.mutate(|_, root| {
-                    let callstack = root.callstack.read();
-                    if let Some(callstack) = callstack.avm2 {
-                        let stack = callstack.read();
-                        if !stack.is_empty() {
-                            f(&stack)
-                        }
+                    let callstack = root.avm2_callstack.borrow();
+                    if !callstack.is_empty() {
+                        f(&callstack);
                     }
                 })
             }
+        }
+    }
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct MouseData<'gc> {
+    /// The object that the mouse is currently hovering over.
+    pub hovered: Option<InteractiveObject<'gc>>,
+
+    /// If the mouse is down, the object that the mouse is currently pressing.
+    pub pressed: Option<InteractiveObject<'gc>>,
+    pub right_pressed: Option<InteractiveObject<'gc>>,
+    pub middle_pressed: Option<InteractiveObject<'gc>>,
+}
+
+impl<'gc> MouseData<'gc> {
+    pub fn pressed(&self, button: MouseButton) -> Option<InteractiveObject<'gc>> {
+        match button {
+            MouseButton::Unknown => None,
+            MouseButton::Left => self.pressed,
+            MouseButton::Right => self.right_pressed,
+            MouseButton::Middle => self.middle_pressed,
+        }
+    }
+
+    pub fn set_pressed(&mut self, button: MouseButton, value: Option<InteractiveObject<'gc>>) {
+        match button {
+            MouseButton::Unknown => {}
+            MouseButton::Left => self.pressed = value,
+            MouseButton::Right => self.right_pressed = value,
+            MouseButton::Middle => self.middle_pressed = value,
         }
     }
 }
@@ -122,11 +143,7 @@ struct GcRootData<'gc> {
     /// accessed in AVM2.
     stage: Stage<'gc>,
 
-    /// The display object that the mouse is currently hovering over.
-    mouse_hovered_object: Option<InteractiveObject<'gc>>,
-
-    /// If the mouse is down, the display object that the mouse is currently pressing.
-    mouse_pressed_object: Option<InteractiveObject<'gc>>,
+    mouse_data: MouseData<'gc>,
 
     /// The object being dragged via a `startDrag` action.
     drag_object: Option<DragObject<'gc>>,
@@ -159,9 +176,6 @@ struct GcRootData<'gc> {
     /// External interface for (for example) JavaScript <-> ActionScript interaction
     external_interface: ExternalInterface<'gc>,
 
-    /// A tracker for the current keyboard focused element
-    focus_tracker: FocusTracker<'gc>,
-
     /// Manager of active sound instances.
     audio_manager: AudioManager<'gc>,
 
@@ -186,7 +200,7 @@ struct GcRootData<'gc> {
 pub struct PostFrameCallback<'gc> {
     #[collect(require_static)]
     #[allow(clippy::type_complexity)]
-    pub callback: Box<dyn for<'b> FnOnce(&mut UpdateContext<'_, 'b>, DisplayObject<'b>) + 'static>,
+    pub callback: Box<dyn for<'b> FnOnce(&mut UpdateContext<'b>, DisplayObject<'b>) + 'static>,
     pub data: DisplayObject<'gc>,
 }
 
@@ -217,6 +231,7 @@ impl<'gc> GcRootData<'gc> {
         &mut NetConnections<'gc>,
         &mut LocalConnections<'gc>,
         &mut Vec<PostFrameCallback<'gc>>,
+        &mut MouseData<'gc>,
         DynamicRootSet<'gc>,
     ) {
         (
@@ -240,6 +255,7 @@ impl<'gc> GcRootData<'gc> {
             &mut self.net_connections,
             &mut self.local_connections,
             &mut self.post_frame_callbacks,
+            &mut self.mouse_data,
             self.dynamic_root,
         )
     }
@@ -254,6 +270,13 @@ type Storage = Box<dyn StorageBackend>;
 type Log = Box<dyn LogBackend>;
 type Ui = Box<dyn UiBackend>;
 type Video = Box<dyn VideoBackend>;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RunState {
+    Playing,
+    Suspended,
+    Stepping,
+}
 
 pub struct Player {
     /// The version of the player we're emulating.
@@ -275,7 +298,7 @@ pub struct Player {
 
     swf: Arc<SwfMovie>,
 
-    is_playing: bool,
+    run_state: RunState,
     needs_render: bool,
 
     renderer: Renderer,
@@ -357,15 +380,63 @@ pub struct Player {
     /// Any compatibility rules to apply for this movie.
     compatibility_rules: CompatibilityRules,
 
-    /// A map from gamepad buttons to key codes.
-    gamepad_button_mapping: HashMap<GamepadButton, KeyCode>,
-
     /// Debug UI windows
     #[cfg(feature = "egui")]
     debug_ui: Rc<RefCell<crate::debug_ui::DebugUi>>,
 }
 
 impl Player {
+    // This method will panic if called inside an `enter_arena_mut` call.
+    fn enter_arena<F, T>(&self, f: F) -> T
+    where
+        F: for<'gc> FnOnce(&'gc Mutation<'gc>, &'gc GcRootData<'gc>, &'gc Self) -> T,
+    {
+        let borrow = self.gc_arena.try_borrow().ok();
+        let result = borrow.and_then(|arena| {
+            arena.mutate(|mc, root| {
+                let root = root.data.try_borrow().ok()?;
+
+                // SAFETY: The 'gc lifetime is generative, and can be soundly conflated with
+                // the lifetime of shorter borrows, as `&'gc T`s aren't `Collect` and cannot
+                // outlive the closure.
+                Some(unsafe {
+                    let root = &*(root.deref() as *const _);
+                    let this = &*(self as *const _);
+                    f(mc, root, this)
+                })
+            })
+        });
+        result.expect("arena already mutably borrowed")
+    }
+
+    // This method will panic if called inside another `enter_arena_mut` call.
+    fn enter_arena_mut<F, T>(&mut self, f: F) -> T
+    where
+        F: for<'gc> FnOnce(&'gc Mutation<'gc>, &'gc mut GcRootData<'gc>, &'gc mut Self) -> T,
+    {
+        // To allow passing a `&mut Self` to the user-provided function, we avoid borrowing directly from self.
+        let arena = Rc::clone(&self.gc_arena);
+
+        // Do not borrow the arena mutably, to keep it accessible while inside a panic handler.
+        let borrow = arena.try_borrow().ok();
+
+        let result = borrow.and_then(|arena| {
+            arena.mutate(|mc, root| {
+                let mut root = root.data.try_borrow_mut(mc).ok()?;
+
+                // SAFETY: The 'gc lifetime is generative, and can be soundly conflated with
+                // the lifetime of shorter borrows, as `&'gc T`s aren't `Collect` and cannot
+                // outlive the closure.
+                Some(unsafe {
+                    let root = &mut *(root.deref_mut() as *mut _);
+                    let this = &mut *(self as *mut _);
+                    f(mc, root, this)
+                })
+            })
+        });
+        result.expect("arena already borrowed")
+    }
+
     /// Fetch the root movie.
     ///
     /// This should not be called if a root movie fetch has already been kicked
@@ -409,7 +480,7 @@ impl Player {
         if self.recent_run_frame_timings.is_empty() {
             5
         } else {
-            let frame_time = 1000.0 / self.frame_rate;
+            let frame_time = self.frame_time(1000.0);
             let average_run_frame_time = self.recent_run_frame_timings.iter().sum::<f64>()
                 / self.recent_run_frame_timings.len() as f64;
             ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK)
@@ -423,11 +494,19 @@ impl Player {
         }
     }
 
+    fn frame_time(&self, time_unit: f64) -> f64 {
+        let frame_rate = self.frame_rate;
+        if frame_rate == 0.0 || frame_rate.is_nan() {
+            0.0
+        } else {
+            time_unit / frame_rate
+        }
+    }
+
     pub fn tick(&mut self, dt: f64) {
         if self.is_playing() {
             self.frame_accumulator += dt;
-            let frame_rate = self.frame_rate;
-            let frame_time = 1000.0 / frame_rate;
+            let frame_time = self.frame_time(1000.0);
 
             let max_frames_per_tick = self.max_frames_per_tick();
             let mut frame = 0;
@@ -447,6 +526,12 @@ impl Player {
                 // to delay the future frame.
                 if self.time_offset > 0 {
                     self.frame_accumulator -= self.time_offset as f64;
+                }
+
+                // If we are stepping a single frame, immediately suspend ourselves.
+                if self.run_state == RunState::Stepping {
+                    self.set_run_state(RunState::Suspended);
+                    break;
                 }
             }
 
@@ -490,7 +575,7 @@ impl Player {
     /// Returns the approximate duration of time until the next frame is due to run.
     /// This is only an approximation to be used for sleep durations.
     pub fn time_til_next_frame(&self) -> std::time::Duration {
-        let frame_time = 1000.0 / self.frame_rate;
+        let frame_time = self.frame_time(1000.0);
         let mut dt = if self.frame_accumulator <= 0.0 {
             frame_time
         } else if self.frame_accumulator >= frame_time {
@@ -509,7 +594,10 @@ impl Player {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.is_playing
+        match self.run_state {
+            RunState::Playing | RunState::Stepping => true,
+            RunState::Suspended => false,
+        }
     }
 
     pub fn mouse_in_stage(&self) -> bool {
@@ -540,33 +628,26 @@ impl Player {
                 return vec![];
             }
 
-            // TODO: This should use a pointed display object with `.menu`
-            let root_dobj = context.stage.root_clip();
+            let display_obj = Player::get_context_menu_display_object(context);
 
-            let menu = if let Some(Value::Object(obj)) = root_dobj.map(|root| root.object()) {
-                let mut activation = Activation::from_stub(
-                    context.reborrow(),
-                    ActivationIdentifier::root("[ContextMenu]"),
-                );
+            let menu = if let Some(Value::Object(obj)) = display_obj.map(|obj| obj.object()) {
+                let mut activation =
+                    Activation::from_stub(context, ActivationIdentifier::root("[ContextMenu]"));
                 let menu_object = if let Ok(Value::Object(menu)) = obj.get("menu", &mut activation)
                 {
                     if let Ok(Value::Object(on_select)) = menu.get("onSelect", &mut activation) {
-                        Self::run_context_menu_custom_callback(
-                            menu,
-                            on_select,
-                            &mut activation.context,
-                        );
+                        Self::run_context_menu_custom_callback(menu, on_select, activation.context);
                     }
                     Some(menu)
                 } else {
                     None
                 };
 
-                crate::avm1::make_context_menu_state(menu_object, &mut activation)
-            } else if let Some(Avm2Value::Object(hit_obj)) = root_dobj.map(|root| root.object2()) {
-                let mut activation = Avm2Activation::from_nothing(context.reborrow());
+                crate::avm1::make_context_menu_state(menu_object, display_obj, &mut activation)
+            } else if let Some(Avm2Value::Object(hit_obj)) = display_obj.map(|obj| obj.object2()) {
+                let mut activation = Avm2Activation::from_nothing(context);
 
-                let menu_object = root_dobj
+                let menu_object = display_obj
                     .expect("Root is confirmed to exist here")
                     .as_interactive()
                     .map(|iobj| iobj.context_menu())
@@ -590,15 +671,15 @@ impl Player {
                         )
                         .expect("Context menu event should be constructed!");
 
-                    Avm2::dispatch_event(&mut activation.context, menu_evt, menu_object);
+                    Avm2::dispatch_event(activation.context, menu_evt, menu_object);
                 }
 
-                crate::avm2::make_context_menu_state(menu_object, &mut activation)
+                crate::avm2::make_context_menu_state(menu_object, display_obj, &mut activation)
             } else {
                 // no AVM1 or AVM2 object - so just prepare the builtin items
                 let mut menu = ContextMenuState::new();
                 let builtin_items = BuiltInItemFlags::for_stage(context.stage);
-                menu.build_builtin_items(builtin_items, context.stage, &context.ui.language());
+                menu.build_builtin_items(builtin_items, context);
                 menu
             };
 
@@ -609,9 +690,8 @@ impl Player {
     }
 
     pub fn clear_custom_menu_items(&mut self) {
-        self.gc_arena.borrow().mutate(|gc_context, gc_root| {
-            let mut root_data = gc_root.data.write(gc_context);
-            root_data.current_context_menu = None;
+        self.enter_arena_mut(|_, gc_root, _| {
+            gc_root.current_context_menu = None;
         });
     }
 
@@ -628,14 +708,11 @@ impl Player {
                     ContextMenuCallback::Back => Self::back_root_movie(context),
                     ContextMenuCallback::Rewind => Self::rewind_root_movie(context),
                     ContextMenuCallback::Avm2 { item } => {
-                        // TODO: This should use the pointed display object (see comment on line 614)
-                        let root_dobj = context.stage.root_clip();
-
-                        if let Some(root_dobj) = root_dobj {
+                        if let Some(display_obj) = menu.get_display_object() {
                             let menu_item = *item;
-                            let mut activation = Avm2Activation::from_nothing(context.reborrow());
+                            let mut activation = Avm2Activation::from_nothing(context);
 
-                            let menu_obj = root_dobj
+                            let menu_obj = display_obj
                                 .as_interactive()
                                 .map(|iobj| iobj.context_menu())
                                 .and_then(|v| v.as_object());
@@ -652,8 +729,8 @@ impl Player {
                                             "menuItemSelect".into(),
                                             false.into(),
                                             false.into(),
-                                            root_dobj.object2(),
-                                            root_dobj.object2(),
+                                            display_obj.object2(),
+                                            display_obj.object2(),
                                         ],
                                     )
                                     .expect("Context menu event should be constructed!");
@@ -671,6 +748,9 @@ impl Player {
                     ContextMenuCallback::QualityHigh => {
                         context.stage.set_quality(context, StageQuality::High)
                     }
+                    ContextMenuCallback::TextControl { code, text } => {
+                        text.text_control_input(*code, context)
+                    }
                     _ => {}
                 }
                 Self::run_actions(context);
@@ -681,26 +761,55 @@ impl Player {
     fn run_context_menu_custom_callback<'gc>(
         item: Object<'gc>,
         callback: Object<'gc>,
-        context: &mut UpdateContext<'_, 'gc>,
+        context: &mut UpdateContext<'gc>,
     ) {
-        if let Some(root_clip) = context.stage.root_clip() {
-            let mut activation = Activation::from_nothing(
-                context.reborrow(),
-                ActivationIdentifier::root("[Context Menu Callback]"),
-                root_clip,
-            );
+        if let Some(menu_state) = context.current_context_menu {
+            if let Some(display_object) = menu_state.get_display_object() {
+                let mut activation = Activation::from_nothing(
+                    context,
+                    ActivationIdentifier::root("[Context Menu Callback]"),
+                    display_object,
+                );
 
-            // TODO: Remember to also change the first arg
-            // when we support contextmenu on non-root-movie
-            let params = vec![root_clip.object(), Value::Object(item)];
+                let params = vec![display_object.object(), Value::Object(item)];
 
-            let _ = callback.call(
-                "[Context Menu Callback]".into(),
-                &mut activation,
-                Value::Undefined,
-                &params,
-            );
+                let _ = callback.call(
+                    "[Context Menu Callback]".into(),
+                    &mut activation,
+                    Value::Undefined,
+                    &params,
+                );
+            }
         }
+    }
+
+    ///Returns the first display object that the mouse is hovering over that has a custom context menu. Returns root if none is found.
+    fn get_context_menu_display_object<'gc>(
+        context: &mut UpdateContext<'gc>,
+    ) -> Option<DisplayObject<'gc>> {
+        let mut picked_obj =
+            run_mouse_pick(context, false).map(|picked_obj| picked_obj.as_displayobject());
+
+        while let Some(display_obj) = picked_obj {
+            if let Value::Object(obj) = display_obj.object() {
+                let mut activation =
+                    Activation::from_stub(context, ActivationIdentifier::root("[ContextMenu]"));
+
+                if let Ok(Value::Object(_)) = obj.get("menu", &mut activation) {
+                    return Some(display_obj);
+                }
+            }
+
+            picked_obj = display_obj.parent();
+        }
+
+        context.stage.root_clip()
+    }
+
+    pub fn is_fullscreen(&mut self) -> bool {
+        self.mutate_with_update_context(|context| {
+            context.stage.display_state() != StageDisplayState::Normal
+        })
     }
 
     pub fn set_fullscreen(&mut self, is_fullscreen: bool) {
@@ -714,7 +823,7 @@ impl Player {
         });
     }
 
-    fn toggle_play_root_movie(context: &mut UpdateContext<'_, '_>) {
+    fn toggle_play_root_movie(context: &mut UpdateContext<'_>) {
         if let Some(mc) = context
             .stage
             .root_clip()
@@ -727,7 +836,7 @@ impl Player {
             }
         }
     }
-    fn rewind_root_movie(context: &mut UpdateContext<'_, '_>) {
+    fn rewind_root_movie(context: &mut UpdateContext<'_>) {
         if let Some(mc) = context
             .stage
             .root_clip()
@@ -736,7 +845,7 @@ impl Player {
             mc.goto_frame(context, 1, true)
         }
     }
-    fn forward_root_movie(context: &mut UpdateContext<'_, '_>) {
+    fn forward_root_movie(context: &mut UpdateContext<'_>) {
         if let Some(mc) = context
             .stage
             .root_clip()
@@ -745,7 +854,7 @@ impl Player {
             mc.next_frame(context);
         }
     }
-    fn back_root_movie(context: &mut UpdateContext<'_, '_>) {
+    fn back_root_movie(context: &mut UpdateContext<'_>) {
         if let Some(mc) = context
             .stage
             .root_clip()
@@ -755,14 +864,35 @@ impl Player {
         }
     }
 
-    pub fn set_is_playing(&mut self, v: bool) {
-        if v {
+    fn set_run_state(&mut self, state: RunState) {
+        let play_audio = match state {
+            RunState::Playing => true,
+            RunState::Suspended => false,
+            // Do not run audio when stepping frame-by-frame,
+            // to avoid unpleasant short bursts of sound.
+            RunState::Stepping => false,
+        };
+
+        if play_audio {
             // Allow auto-play after user gesture for web backends.
             self.audio.play();
         } else {
             self.audio.pause();
         }
-        self.is_playing = v;
+
+        self.run_state = state;
+    }
+
+    pub fn set_is_playing(&mut self, v: bool) {
+        self.set_run_state(if v {
+            RunState::Playing
+        } else {
+            RunState::Suspended
+        });
+    }
+
+    pub fn suspend_after_next_frame(&mut self) {
+        self.set_run_state(RunState::Stepping);
     }
 
     pub fn needs_render(&self) -> bool {
@@ -775,9 +905,7 @@ impl Player {
 
     pub fn set_background_color(&mut self, color: Option<Color>) {
         self.mutate_with_update_context(|context| {
-            context
-                .stage
-                .set_background_color(context.gc_context, color)
+            context.stage.set_background_color(context.gc(), color)
         })
     }
 
@@ -787,7 +915,7 @@ impl Player {
 
     pub fn set_letterbox(&mut self, letterbox: Letterbox) {
         self.mutate_with_update_context(|context| {
-            context.stage.set_letterbox(context.gc_context, letterbox)
+            context.stage.set_letterbox(context.gc(), letterbox)
         })
     }
 
@@ -825,6 +953,10 @@ impl Player {
         })
     }
 
+    pub fn quality(&mut self) -> StageQuality {
+        self.mutate_with_update_context(|context| context.stage.quality())
+    }
+
     pub fn set_quality(&mut self, quality: StageQuality) {
         self.mutate_with_update_context(|context| {
             context.stage.set_quality(context, quality);
@@ -840,10 +972,57 @@ impl Player {
         })
     }
 
+    pub fn scale_mode(&mut self) -> StageScaleMode {
+        self.mutate_with_update_context(|context| context.stage.scale_mode())
+    }
+
+    pub fn set_scale_mode(&mut self, scale_mode: StageScaleMode) {
+        self.mutate_with_update_context(|context| {
+            context.stage.set_scale_mode(context, scale_mode, false);
+        })
+    }
+
+    pub fn forced_scale_mode(&mut self) -> bool {
+        self.mutate_with_update_context(|context| context.stage.forced_scale_mode())
+    }
+
+    pub fn set_forced_scale_mode(&mut self, force: bool) {
+        self.mutate_with_update_context(|context| {
+            context.stage.set_forced_scale_mode(context, force);
+        })
+    }
+
     /// Handle an event sent into the player from the external windowing system
     /// or an HTML element.
-    ///
-    /// Event handling is a complicated affair, involving several different
+    pub fn handle_event(&mut self, event: PlayerEvent) -> bool {
+        match event {
+            PlayerEvent::FocusGained | PlayerEvent::FocusLost => self.handle_focus_event(event),
+            PlayerEvent::KeyDown { .. }
+            | PlayerEvent::KeyUp { .. }
+            | PlayerEvent::MouseMove { .. }
+            | PlayerEvent::MouseUp { .. }
+            | PlayerEvent::MouseDown { .. }
+            | PlayerEvent::MouseLeave
+            | PlayerEvent::MouseWheel { .. }
+            | PlayerEvent::GamepadButtonDown { .. }
+            | PlayerEvent::GamepadButtonUp { .. }
+            | PlayerEvent::TextInput { .. }
+            | PlayerEvent::TextControl { .. } => self.handle_input_event(event),
+        }
+    }
+
+    fn handle_focus_event(&mut self, event: PlayerEvent) -> bool {
+        if let PlayerEvent::FocusLost = event {
+            self.mutate_with_update_context(|context| {
+                let focus_tracker = context.focus_tracker;
+                focus_tracker.reset_focus(context);
+            });
+        }
+
+        true
+    }
+
+    /// Input event handling is a complicated affair, involving several different
     /// concerns that need to resolve with specific priority.
     ///
     /// 0. Transform gamepad button events into key events.
@@ -865,51 +1044,34 @@ impl Player {
     /// 7. The AVM1 action queue is drained.
     /// 8. Mouse state is updated. This triggers button rollovers, which are a
     ///    second wave of event processing.
-    pub fn handle_event(&mut self, event: PlayerEvent) {
-        // Optionally transform gamepad button events into key events.
-        let event = match event {
-            PlayerEvent::GamepadButtonDown { button } => {
-                if let Some(key_code) = self.gamepad_button_mapping.get(&button) {
-                    PlayerEvent::KeyDown {
-                        key_code: *key_code,
-                        key_char: None,
-                    }
-                } else {
-                    // Just ignore this event.
-                    return;
-                }
-            }
-            PlayerEvent::GamepadButtonUp { button } => {
-                if let Some(key_code) = self.gamepad_button_mapping.get(&button) {
-                    PlayerEvent::KeyUp {
-                        key_code: *key_code,
-                        key_char: None,
-                    }
-                } else {
-                    // Just ignore this event.
-                    return;
-                }
-            }
-            _ => event,
+    fn handle_input_event(&mut self, event: PlayerEvent) -> bool {
+        let mut player_event_handled = false;
+        let Some(event) = self.input.map_input_event(event) else {
+            return false;
         };
 
-        let prev_is_mouse_down = self.input.is_mouse_down();
+        let prev_mouse_buttons = self.input.get_mouse_down_buttons();
         self.input.handle_event(&event);
-        let is_mouse_button_changed = self.input.is_mouse_down() != prev_is_mouse_down;
+        let changed_mouse_buttons = self
+            .input
+            .get_mouse_down_buttons()
+            .symmetric_difference(&prev_mouse_buttons)
+            .cloned()
+            .collect();
 
         if cfg!(feature = "avm_debug") {
             match event {
                 PlayerEvent::KeyDown {
                     key_code: KeyCode::V,
                     ..
-                } if self.input.is_key_down(KeyCode::Control)
-                    && self.input.is_key_down(KeyCode::Alt) =>
+                } if self.input.is_key_down(KeyCode::CONTROL)
+                    && self.input.is_key_down(KeyCode::ALT) =>
                 {
                     self.mutate_with_update_context(|context| {
                         let mut dumper = VariableDumper::new("  ");
 
                         let mut activation = Activation::from_stub(
-                            context.reborrow(),
+                            context,
                             ActivationIdentifier::root("[Variable Dumper]"),
                         );
 
@@ -936,8 +1098,8 @@ impl Player {
                 PlayerEvent::KeyDown {
                     key_code: KeyCode::D,
                     ..
-                } if self.input.is_key_down(KeyCode::Control)
-                    && self.input.is_key_down(KeyCode::Alt) =>
+                } if self.input.is_key_down(KeyCode::CONTROL)
+                    && self.input.is_key_down(KeyCode::ALT) =>
                 {
                     self.mutate_with_update_context(|context| {
                         if context.avm1.show_debug_output() {
@@ -958,8 +1120,8 @@ impl Player {
                 PlayerEvent::KeyDown {
                     key_code: KeyCode::F,
                     ..
-                } if self.input.is_key_down(KeyCode::Control)
-                    && self.input.is_key_down(KeyCode::Alt) =>
+                } if self.input.is_key_down(KeyCode::CONTROL)
+                    && self.input.is_key_down(KeyCode::ALT) =>
                 {
                     self.mutate_with_update_context(|context| {
                         context.stage.display_render_tree(0);
@@ -970,52 +1132,17 @@ impl Player {
         }
 
         self.mutate_with_update_context(|context| {
-            // Propagate button events.
-            let button_event = match event {
-                // ASCII characters convert directly to keyPress button events.
-                PlayerEvent::TextInput { codepoint }
-                    if codepoint as u32 >= 32 && codepoint as u32 <= 126 =>
-                {
-                    Some(ClipEvent::KeyPress {
-                        key_code: ButtonKeyCode::from_u8(codepoint as u8).unwrap(),
-                    })
-                }
-
-                // Special keys have custom values for keyPress.
-                PlayerEvent::KeyDown { key_code, .. } => {
-                    if let Some(key_code) = crate::events::key_code_to_button_key_code(key_code) {
-                        Some(ClipEvent::KeyPress { key_code })
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
-            let mut key_press_handled = false;
-            if let Some(button_event) = button_event {
-                for level in context.stage.iter_render_list() {
-                    let state = if let Some(interactive) = level.as_interactive() {
-                        interactive.handle_clip_event(context, button_event)
-                    } else {
-                        ClipEventResult::NotHandled
-                    };
-
-                    if state == ClipEventResult::Handled {
-                        key_press_handled = true;
-                        break;
-                    }
-                }
-            }
+            let button_event = ButtonKeyCode::from_player_event(event)
+                .map(|key_code| ClipEvent::KeyPress { key_code });
 
             if let PlayerEvent::KeyDown { key_code, key_char }
             | PlayerEvent::KeyUp { key_code, key_char } = event
             {
-                let ctrl_key = context.input.is_key_down(KeyCode::Control);
-                let alt_key = context.input.is_key_down(KeyCode::Alt);
-                let shift_key = context.input.is_key_down(KeyCode::Shift);
+                let ctrl_key = context.input.is_key_down(KeyCode::CONTROL);
+                let alt_key = context.input.is_key_down(KeyCode::ALT);
+                let shift_key = context.input.is_key_down(KeyCode::SHIFT);
 
-                let mut activation = Avm2Activation::from_nothing(context.reborrow());
+                let mut activation = Avm2Activation::from_nothing(context);
 
                 let event_name = match event {
                     PlayerEvent::KeyDown { .. } => "keyDown",
@@ -1025,7 +1152,7 @@ impl Player {
 
                 let keyboardevent_class = activation.avm2().classes().keyboardevent;
                 let event_name_val: Avm2Value<'_> =
-                    AvmString::new_utf8(activation.context.gc_context, event_name).into();
+                    AvmString::new_utf8(activation.gc(), event_name).into();
 
                 // TODO: keyLocation should not be a dummy value.
                 // ctrlKey and controlKey can be different from each other on Mac.
@@ -1038,7 +1165,7 @@ impl Player {
                             true.into(),                             /* bubbles */
                             false.into(),                            /* cancelable */
                             key_char.map_or(0, |c| c as u32).into(), /* charCode */
-                            (key_code as u32).into(),                /* keyCode */
+                            key_code.value().into(),                 /* keyCode */
                             0.into(),                                /* keyLocation */
                             ctrl_key.into(),                         /* ctrlKey */
                             alt_key.into(),                          /* altKey */
@@ -1051,6 +1178,7 @@ impl Player {
                     .context
                     .focus_tracker
                     .get()
+                    .map(|o| o.as_displayobject())
                     .unwrap_or_else(|| activation.context.stage.into());
 
                 if target_object.movie().is_action_script_3() {
@@ -1059,21 +1187,7 @@ impl Player {
                         .coerce_to_object(&mut activation)
                         .expect("DisplayObject is not an object!");
 
-                    Avm2::dispatch_event(&mut activation.context, keyboard_event, target);
-                }
-            }
-
-            // keyPress events take precedence over text input.
-            if !key_press_handled {
-                if let PlayerEvent::TextInput { codepoint } = event {
-                    if let Some(text) = context.focus_tracker.get().and_then(|o| o.as_edit_text()) {
-                        text.text_input(codepoint, context);
-                    }
-                }
-                if let PlayerEvent::TextControl { code } = event {
-                    if let Some(text) = context.focus_tracker.get().and_then(|o| o.as_edit_text()) {
-                        text.text_control_input(code, context);
-                    }
+                    Avm2::dispatch_event(activation.context, keyboard_event, target);
                 }
             }
 
@@ -1107,15 +1221,30 @@ impl Player {
                     let delta = Value::from(delta.lines());
                     (None, Some(("Mouse", "onMouseWheel", vec![delta])))
                 }
+                PlayerEvent::MouseUp {
+                    button: MouseButton::Right,
+                    ..
+                } => (Some(ClipEvent::RightMouseUp), None),
+                PlayerEvent::MouseDown {
+                    button: MouseButton::Right,
+                    ..
+                } => (Some(ClipEvent::RightMouseDown), None),
+                PlayerEvent::MouseUp {
+                    button: MouseButton::Middle,
+                    ..
+                } => (Some(ClipEvent::MiddleMouseUp), None),
+                PlayerEvent::MouseDown {
+                    button: MouseButton::Middle,
+                    ..
+                } => (Some(ClipEvent::MiddleMouseDown), None),
                 _ => (None, None),
             };
 
             // Fire clip event on all clips.
             if let Some(clip_event) = clip_event {
-                for level in context.stage.iter_render_list() {
-                    if let Some(interactive) = level.as_interactive() {
-                        interactive.handle_clip_event(context, clip_event);
-                    }
+                if context.stage.handle_clip_event(context, clip_event) == ClipEventResult::Handled
+                {
+                    player_event_handled = true;
                 }
             }
 
@@ -1134,21 +1263,77 @@ impl Player {
                 }
             }
 
+            // Propagate button events.
+            // It has to be done after propagating the clip event,
+            // so that KeyPress is always fired after KeyDown.
+            let key_press_handled = if let Some(button_event) = button_event {
+                context.stage.handle_clip_event(context, button_event) == ClipEventResult::Handled
+            } else {
+                false
+            };
+
+            if key_press_handled {
+                player_event_handled = true;
+            }
+
+            // KeyPress events take precedence over text input.
+            if !key_press_handled {
+                if let Some(text) = context.focus_tracker.get_as_edit_text() {
+                    if let PlayerEvent::TextInput { codepoint } = event {
+                        text.text_input(codepoint, context);
+                    }
+                    if let PlayerEvent::TextControl { code } = event {
+                        text.text_control_input(code, context);
+                    }
+                }
+            }
+
+            // KeyPress events also take precedence over tabbing.
+            if !key_press_handled {
+                if let PlayerEvent::KeyDown {
+                    key_code: KeyCode::TAB,
+                    ..
+                } = event
+                {
+                    let reversed = context.input.is_key_down(KeyCode::SHIFT);
+                    let tracker = context.focus_tracker;
+                    tracker.cycle(context, reversed);
+                }
+            }
+
+            // KeyPress events also take precedence over keyboard navigation.
+            // Note that keyboard navigation works only when the highlight is visible.
+            if !key_press_handled && context.focus_tracker.highlight().is_visible() {
+                if let Some(focus) = context.focus_tracker.get() {
+                    if matches!(
+                        event,
+                        PlayerEvent::KeyDown {
+                            key_code: KeyCode::RETURN,
+                            ..
+                        } | PlayerEvent::TextInput { codepoint: ' ' }
+                    ) {
+                        // The button/clip is pressed and then immediately released.
+                        // We do not have to wait for KeyUp.
+                        focus.handle_clip_event(context, ClipEvent::Press { index: 0 });
+                        focus.handle_clip_event(context, ClipEvent::Release { index: 0 });
+                    }
+
+                    if let PlayerEvent::KeyDown { key_code, .. } = event {
+                        if let Some(direction) = NavigationDirection::from_key_code(key_code) {
+                            let tracker = context.focus_tracker;
+                            tracker.navigate(context, direction);
+                        }
+                    }
+                }
+            }
+
             Self::run_actions(context);
         });
 
         // Update mouse state.
         if let PlayerEvent::MouseMove { x, y }
-        | PlayerEvent::MouseDown {
-            x,
-            y,
-            button: MouseButton::Left,
-        }
-        | PlayerEvent::MouseUp {
-            x,
-            y,
-            button: MouseButton::Left,
-        } = event
+        | PlayerEvent::MouseDown { x, y, .. }
+        | PlayerEvent::MouseUp { x, y, .. } = event
         {
             let inverse_view_matrix =
                 self.mutate_with_update_context(|context| context.stage.inverse_view_matrix());
@@ -1163,36 +1348,84 @@ impl Player {
             let is_mouse_moved = prev_mouse_position != self.mouse_position;
 
             // This fires button rollover/press events, which should run after the above mouseMove events.
-            if self.update_mouse_state(is_mouse_button_changed, is_mouse_moved) {
+            if self.update_mouse_state(
+                &changed_mouse_buttons,
+                is_mouse_moved,
+                &mut player_event_handled,
+            ) {
                 self.needs_render = true;
             }
         }
 
         if let PlayerEvent::MouseWheel { delta } = event {
             self.mutate_with_update_context(|context| {
-                if let Some(over_object) = context.mouse_over_object {
+                let target = if let Some(over_object) = context.mouse_data.hovered {
                     if over_object.as_displayobject().movie().is_action_script_3()
                         || !over_object.as_displayobject().avm1_removed()
                     {
-                        over_object.handle_clip_event(context, ClipEvent::MouseWheel { delta });
+                        Some(over_object)
+                    } else {
+                        None
                     }
                 } else {
-                    context
-                        .stage
-                        .handle_clip_event(context, ClipEvent::MouseWheel { delta });
+                    context.stage.as_interactive()
+                };
+                if let Some(target) = target {
+                    let event = ClipEvent::MouseWheel { delta };
+                    target.event_dispatch_to_avm2(context, event);
+                    target.handle_clip_event(context, event);
                 }
             });
         }
 
         if let PlayerEvent::MouseLeave = event {
-            if self.update_mouse_state(is_mouse_button_changed, true) {
+            if self.update_mouse_state(&changed_mouse_buttons, true, &mut player_event_handled) {
                 self.needs_render = true;
             }
         }
+
+        if self.should_reset_highlight(event) {
+            self.mutate_with_update_context(|context| {
+                context.focus_tracker.reset_highlight();
+            });
+        }
+
+        player_event_handled
+    }
+
+    fn should_reset_highlight(&self, event: PlayerEvent) -> bool {
+        if matches!(
+            event,
+            PlayerEvent::MouseDown {
+                button: MouseButton::Left,
+                ..
+            }
+        ) {
+            // Left mouse button down always resets the highlight.
+            return true;
+        }
+
+        if self.swf.version() < 9
+            && matches!(
+                event,
+                PlayerEvent::MouseDown {
+                    button: MouseButton::Left | MouseButton::Right,
+                    ..
+                } | PlayerEvent::MouseUp {
+                    button: MouseButton::Left | MouseButton::Right,
+                    ..
+                } | PlayerEvent::MouseMove { .. }
+            )
+        {
+            // For SWF8 and older, other mouse events also reset the highlight.
+            return true;
+        }
+
+        false
     }
 
     /// Update dragged object, if any.
-    pub fn update_drag(context: &mut UpdateContext<'_, '_>) {
+    pub fn update_drag(context: &mut UpdateContext<'_>) {
         let mouse_position = *context.mouse_position;
         if let Some(drag_object) = context.drag_object {
             let display_object = drag_object.display_object;
@@ -1225,28 +1458,33 @@ impl Player {
             };
 
             // TODO: Introduce `DisplayObject::set_position()`?
-            display_object.set_x(context.gc_context, new_position.x);
-            display_object.set_y(context.gc_context, new_position.y);
+            display_object.set_x(context.gc(), new_position.x);
+            display_object.set_y(context.gc(), new_position.y);
 
             // Update `_droptarget` property of dragged object.
             if let Some(movie_clip) = display_object.as_movie_clip() {
                 // Turn the dragged object invisible so that we don't pick it.
                 // TODO: This could be handled via adding a `HitTestOptions::SKIP_DRAGGED`.
                 let was_visible = display_object.visible();
-                display_object.set_visible(context.gc_context, false);
+                display_object.set_visible(context, false);
                 // Set `_droptarget` to the object the mouse is hovering over.
                 let drop_target_object = run_mouse_pick(context, false);
                 movie_clip.set_drop_target(
-                    context.gc_context,
+                    context.gc(),
                     drop_target_object.map(|d| d.as_displayobject()),
                 );
-                display_object.set_visible(context.gc_context, was_visible);
+                display_object.set_visible(context, was_visible);
             }
         }
     }
 
     /// Updates the hover state of buttons.
-    fn update_mouse_state(&mut self, is_mouse_button_changed: bool, is_mouse_moved: bool) -> bool {
+    fn update_mouse_state(
+        &mut self,
+        changed_mouse_buttons: &HashSet<MouseButton>,
+        is_mouse_moved: bool,
+        player_event_handled: &mut bool,
+    ) -> bool {
         let mut new_cursor = self.mouse_cursor;
         let mut mouse_cursor_needs_check = self.mouse_cursor_needs_check;
         let mouse_in_stage = self.mouse_in_stage();
@@ -1254,6 +1492,12 @@ impl Player {
         // Determine the display object the mouse is hovering over.
         // Search through levels from top-to-bottom, returning the first display object that is under the mouse.
         let needs_render = self.mutate_with_update_context(|context| {
+            // Objects may be hovered using Tab,
+            // skip mouse hover when it's not necessary.
+            let mut skip_mouse_hover = !is_mouse_moved
+                && changed_mouse_buttons.is_empty()
+                && context.mouse_data.hovered.is_some();
+
             let new_over_object = if mouse_in_stage {
                 run_mouse_pick(context, true)
             } else {
@@ -1270,12 +1514,12 @@ impl Player {
             }
 
             let mut new_over_object_updated = false;
-            // Cancel hover if an object is removed from the stage.
-            if let Some(hovered) = context.mouse_over_object {
+            if let Some(hovered) = context.mouse_data.hovered {
+                // Cancel hover if an object is removed from the stage.
                 if !hovered.as_displayobject().movie().is_action_script_3()
                     && hovered.as_displayobject().avm1_removed()
                 {
-                    context.mouse_over_object = None;
+                    context.mouse_data.hovered = None;
                     if let Some(new_object) = new_over_object {
                         if Self::check_display_object_equality(
                             new_object.as_displayobject(),
@@ -1284,18 +1528,24 @@ impl Player {
                             if let Some(state) = hovered.as_displayobject().state() {
                                 new_object.as_displayobject().set_state(context, state);
                             }
-                            context.mouse_over_object = Some(new_object);
+                            context.mouse_data.hovered = Some(new_object);
                             new_over_object_updated = true;
                         }
                     }
                 }
+
+                // Ensure that hover is canceled when an object disappears,
+                // even if the mouse was idle.
+                if !hovered.as_displayobject().visible() {
+                    skip_mouse_hover = false;
+                }
             }
 
-            if let Some(pressed) = context.mouse_down_object {
+            if let Some(pressed) = context.mouse_data.pressed {
                 if !pressed.as_displayobject().movie().is_action_script_3()
                     && pressed.as_displayobject().avm1_removed()
                 {
-                    context.mouse_down_object = None;
+                    context.mouse_data.pressed = None;
                     let mut display_object = None;
                     if let Some(root_clip) = context.stage.root_clip() {
                         display_object = Self::find_first_character_instance(
@@ -1309,7 +1559,7 @@ impl Player {
                             new_down_object.set_state(context, state);
                         }
 
-                        context.mouse_down_object = new_down_object.as_interactive();
+                        context.mouse_data.pressed = new_down_object.as_interactive();
                     }
                 }
             }
@@ -1317,10 +1567,10 @@ impl Player {
             // Update the cursor if the object was removed from the stage.
             if new_cursor != MouseCursor::Arrow {
                 let object_removed =
-                    context.mouse_over_object.is_none() && context.mouse_down_object.is_none();
+                    context.mouse_data.hovered.is_none() && context.mouse_data.pressed.is_none();
                 if !object_removed {
                     mouse_cursor_needs_check = false;
-                    if is_mouse_button_changed {
+                    if changed_mouse_buttons.contains(&MouseButton::Left) {
                         // The object is pressed/released and may be removed immediately, we need to check
                         // in the next frame if it still exists. If it doesn't, we'll update the cursor.
                         mouse_cursor_needs_check = true;
@@ -1328,8 +1578,8 @@ impl Player {
                 } else if mouse_cursor_needs_check {
                     mouse_cursor_needs_check = false;
                     new_cursor = MouseCursor::Arrow;
-                } else if !context.input.is_mouse_down()
-                    && (is_mouse_moved || is_mouse_button_changed)
+                } else if !context.input.is_mouse_down(MouseButton::Left)
+                    && (is_mouse_moved || changed_mouse_buttons.contains(&MouseButton::Left))
                 {
                     // In every other case, the cursor remains until the user interacts with the mouse again.
                     new_cursor = MouseCursor::Arrow;
@@ -1338,16 +1588,18 @@ impl Player {
                 mouse_cursor_needs_check = false;
             }
 
-            let cur_over_object = context.mouse_over_object;
+            let cur_over_object = context.mouse_data.hovered;
             // Check if a new object has been hovered over.
-            if !InteractiveObject::option_ptr_eq(cur_over_object, new_over_object) {
+            if !skip_mouse_hover
+                && !InteractiveObject::option_ptr_eq(cur_over_object, new_over_object)
+            {
                 // If the mouse button is down, the object the user clicked on grabs the focus
                 // and fires "drag" events. Other objects are ignored.
-                if context.input.is_mouse_down() {
-                    context.mouse_over_object = new_over_object;
-                    if let Some(down_object) = context.mouse_down_object {
+                if context.input.is_mouse_down(MouseButton::Left) {
+                    context.mouse_data.hovered = new_over_object;
+                    if let Some(down_object) = context.mouse_data.pressed {
                         if InteractiveObject::option_ptr_eq(
-                            context.mouse_down_object,
+                            context.mouse_data.pressed,
                             cur_over_object,
                         ) {
                             // Dragged from outside the clicked object to the inside.
@@ -1358,7 +1610,7 @@ impl Player {
                                 },
                             ));
                         } else if InteractiveObject::option_ptr_eq(
-                            context.mouse_down_object,
+                            context.mouse_data.pressed,
                             new_over_object,
                         ) {
                             // Dragged from inside the clicked object to the outside.
@@ -1395,32 +1647,52 @@ impl Player {
                     }
                 }
             }
-            if !new_over_object_updated {
-                context.mouse_over_object = new_over_object;
+            if !skip_mouse_hover && !new_over_object_updated {
+                context.mouse_data.hovered = new_over_object;
             }
             // Handle presses and releases.
-            if is_mouse_button_changed {
-                if context.input.is_mouse_down() {
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                if !changed_mouse_buttons.contains(&button) {
+                    continue;
+                }
+
+                if context.input.is_mouse_down(button) {
+                    let event = match button {
+                        MouseButton::Left => ClipEvent::Press {
+                            index: context.input.last_click_index(),
+                        },
+                        MouseButton::Right => ClipEvent::RightPress,
+                        MouseButton::Middle => ClipEvent::MiddlePress,
+                        _ => unreachable!(),
+                    };
                     // Pressed on a hovered object.
-                    if let Some(over_object) = context.mouse_over_object {
-                        events.push((over_object, ClipEvent::Press));
-                        context.mouse_down_object = context.mouse_over_object;
+                    if let Some(over_object) = context.mouse_data.hovered {
+                        events.push((over_object, event));
+                        context
+                            .mouse_data
+                            .set_pressed(button, context.mouse_data.hovered);
                     } else {
-                        events.push((context.stage.into(), ClipEvent::Press));
+                        events.push((context.stage.into(), event));
                     }
                 } else {
-                    if let Some(over_object) = context.mouse_over_object {
-                        events.push((over_object, ClipEvent::MouseUpInside));
+                    let event = match button {
+                        MouseButton::Left => ClipEvent::MouseUpInside,
+                        MouseButton::Right => ClipEvent::RightMouseUpInside,
+                        MouseButton::Middle => ClipEvent::MiddleMouseUpInside,
+                        _ => unreachable!(),
+                    };
+                    if let Some(over_object) = context.mouse_data.hovered {
+                        events.push((over_object, event));
                     } else {
-                        events.push((context.stage.into(), ClipEvent::MouseUpInside));
+                        events.push((context.stage.into(), event));
                     }
 
                     let mut released_inside = InteractiveObject::option_ptr_eq(
-                        context.mouse_down_object,
-                        context.mouse_over_object,
+                        context.mouse_data.pressed(button),
+                        context.mouse_data.hovered,
                     );
-                    if let Some(down) = context.mouse_down_object {
-                        if let Some(over) = context.mouse_over_object {
+                    if let Some(down) = context.mouse_data.pressed(button) {
+                        if let Some(over) = context.mouse_data.hovered {
                             if !released_inside {
                                 released_inside = Self::check_display_object_equality(
                                     down.as_displayobject(),
@@ -1430,34 +1702,53 @@ impl Player {
                         }
                     }
                     if released_inside {
+                        let event = match button {
+                            MouseButton::Left => ClipEvent::Release {
+                                index: context.input.last_click_index(),
+                            },
+                            MouseButton::Right => ClipEvent::RightRelease,
+                            MouseButton::Middle => ClipEvent::MiddleRelease,
+                            _ => unreachable!(),
+                        };
                         // Released inside the clicked object.
-                        if let Some(down_object) = context.mouse_down_object {
-                            new_cursor = down_object.mouse_cursor(context);
-                            events.push((down_object, ClipEvent::Release));
+                        if let Some(down_object) = context.mouse_data.pressed(button) {
+                            if button == MouseButton::Left {
+                                new_cursor = down_object.mouse_cursor(context);
+                            }
+                            events.push((down_object, event));
                         } else {
-                            events.push((context.stage.into(), ClipEvent::Release));
+                            events.push((context.stage.into(), event));
                         }
                     } else {
+                        let event = match button {
+                            MouseButton::Left => ClipEvent::ReleaseOutside,
+                            MouseButton::Right => ClipEvent::RightReleaseOutside,
+                            MouseButton::Middle => ClipEvent::MiddleReleaseOutside,
+                            _ => unreachable!(),
+                        };
                         // Released outside the clicked object.
-                        if let Some(down_object) = context.mouse_down_object {
-                            events.push((down_object, ClipEvent::ReleaseOutside));
+                        if let Some(down_object) = context.mouse_data.pressed(button) {
+                            events.push((down_object, event));
                         } else {
-                            events.push((context.stage.into(), ClipEvent::ReleaseOutside));
+                            events.push((context.stage.into(), event));
                         }
-                        // The new object is rolled over immediately.
-                        if let Some(over_object) = context.mouse_over_object {
-                            new_cursor = over_object.mouse_cursor(context);
-                            events.push((
-                                over_object,
-                                ClipEvent::RollOver {
-                                    from: cur_over_object,
-                                },
-                            ));
-                        } else {
-                            new_cursor = MouseCursor::Arrow;
+
+                        if button == MouseButton::Left {
+                            // The new object is rolled over immediately.
+                            if let Some(over_object) = context.mouse_data.hovered {
+                                new_cursor = over_object.mouse_cursor(context);
+                                events.push((
+                                    over_object,
+                                    ClipEvent::RollOver {
+                                        from: cur_over_object,
+                                    },
+                                ));
+                            } else {
+                                new_cursor = MouseCursor::Arrow;
+                            }
                         }
                     }
-                    context.mouse_down_object = None;
+                    context.mouse_data.set_pressed(button, None);
                 }
             }
 
@@ -1469,9 +1760,15 @@ impl Player {
                 for (object, event) in events {
                     let display_object = object.as_displayobject();
                     if !display_object.avm1_removed() {
-                        object.handle_clip_event(context, event);
-                        if display_object.movie().is_action_script_3() {
-                            object.event_dispatch_to_avm2(context, event);
+                        if object.handle_clip_event(context, event) == ClipEventResult::Handled {
+                            *player_event_handled = true;
+                        }
+                        if matches!(event, ClipEvent::Press { .. }) {
+                            Self::update_focus_on_mouse_press(context, display_object);
+                        }
+                        if object.event_dispatch_to_avm2(context, event) == ClipEventResult::Handled
+                        {
+                            *player_event_handled = true;
                         }
                     }
                     if !refresh && event.is_button_event() {
@@ -1500,6 +1797,32 @@ impl Player {
         self.mouse_cursor_needs_check = mouse_cursor_needs_check;
 
         needs_render
+    }
+
+    fn update_focus_on_mouse_press<'gc>(
+        context: &mut UpdateContext<'gc>,
+        pressed_object: DisplayObject<'gc>,
+    ) {
+        let tracker = context.focus_tracker;
+        let mut pressed_object = pressed_object.as_interactive();
+        if InteractiveObject::option_ptr_eq(pressed_object, context.stage.as_interactive()) {
+            pressed_object = None;
+        }
+
+        let should_focus = pressed_object.is_some_and(|int| {
+            // AVM2 fires focus change events even if the related object is not focusable
+            int.as_displayobject().movie().is_action_script_3()
+                || int.is_focusable_by_mouse(context)
+        });
+        if should_focus {
+            tracker.set_by_mouse(pressed_object, context);
+        } else if tracker
+            .get()
+            .is_some_and(|int| int.is_focusable_by_mouse(context))
+        {
+            // Need to clear the focus if an object focusable by mouse was un-focused.
+            tracker.set_by_mouse(None, context);
+        }
     }
 
     //Checks if two displayObjects have the same depth and id and accur in the same movie.s
@@ -1555,7 +1878,7 @@ impl Player {
                 did_finish = root.preload(context, limit);
 
                 if let Some(loader_info) = root.loader_info().filter(|_| !was_root_movie_loaded) {
-                    let mut activation = Avm2Activation::from_nothing(context.reborrow());
+                    let mut activation = Avm2Activation::from_nothing(context);
 
                     let progress_evt = activation.avm2().classes().progressevent.construct(
                         &mut activation,
@@ -1584,13 +1907,16 @@ impl Player {
                 did_finish = LoadManager::preload_tick(context, limit);
             }
 
+            Self::run_actions(context);
+
             did_finish
         })
     }
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
-        let frame_time = Duration::from_nanos((750_000_000.0 / self.frame_rate) as u64);
+        let frame_time = self.frame_time(750_000_000.0);
+        let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
             LoadBehavior::Streaming => (
                 ExecutionLimit::with_max_ops_and_time(10000, frame_time),
@@ -1613,6 +1939,7 @@ impl Player {
             run_all_phases_avm2(context);
             Avm1::run_frame(context);
             AudioManager::update_sounds(context);
+            LocalConnections::update_connections(context);
 
             // Only run the current list of callbacks - any callbacks added during callback execution
             // will be run at the end of the *next* frame.
@@ -1626,10 +1953,8 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) {
-        let invalidated = self
-            .gc_arena
-            .borrow()
-            .mutate(|_, gc_root| gc_root.data.read().stage.invalidated());
+        let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
+
         if invalidated {
             self.update(|context| {
                 let stage = context.stage;
@@ -1639,18 +1964,17 @@ impl Player {
 
         let mut background_color = Color::WHITE;
 
-        let (cache_draws, commands) = self.gc_arena.borrow().mutate(|gc_context, gc_root| {
-            let root_data = gc_root.data.read();
-            let stage = root_data.stage;
+        let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
+            let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
             let mut render_context = RenderContext {
-                renderer: self.renderer.deref_mut(),
+                renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
                 cache_draws: &mut cache_draws,
                 gc_context,
-                library: &root_data.library,
-                transform_stack: &mut self.transform_stack,
+                library: &gc_root.library,
+                transform_stack: &mut this.transform_stack,
                 is_offscreen: false,
                 use_bitmap_cache: true,
                 stage,
@@ -1660,10 +1984,9 @@ impl Player {
 
             #[cfg(feature = "egui")]
             {
-                let debug_ui = self.debug_ui.clone();
-                debug_ui
+                this.debug_ui
                     .borrow_mut()
-                    .draw_debug_rects(&mut render_context, root_data.dynamic_root);
+                    .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
             }
 
             background_color =
@@ -1701,6 +2024,10 @@ impl Player {
         &self.navigator
     }
 
+    pub fn navigator_mut(&mut self) -> &mut Navigator {
+        &mut self.navigator
+    }
+
     // The frame rate of the current movie in FPS.
     pub fn frame_rate(&self) -> f64 {
         self.frame_rate
@@ -1734,7 +2061,7 @@ impl Player {
         &mut self.ui
     }
 
-    pub fn run_actions(context: &mut UpdateContext<'_, '_>) {
+    pub fn run_actions(context: &mut UpdateContext<'_>) {
         // Note that actions can queue further actions, so a while loop is necessary here.
         while let Some(action) = context.action_queue.pop_action() {
             // We don't run frame actions if the clip was removed (or scheduled to be removed) after it queued the action.
@@ -1756,14 +2083,14 @@ impl Player {
                     events,
                 } => {
                     let mut activation = Activation::from_nothing(
-                        context.reborrow(),
+                        context,
                         ActivationIdentifier::root("[Construct]"),
                         action.clip,
                     );
                     if let Ok(prototype) = constructor.get("prototype", &mut activation) {
                         if let Value::Object(object) = action.clip.object() {
                             object.define_value(
-                                activation.context.gc_context,
+                                activation.gc(),
                                 "__proto__",
                                 prototype,
                                 Attribute::DONT_ENUM | Attribute::DONT_DELETE,
@@ -1833,14 +2160,9 @@ impl Player {
     /// This takes cares of populating the `UpdateContext` struct, avoiding borrow issues.
     pub fn mutate_with_update_context<F, R>(&mut self, f: F) -> R
     where
-        F: for<'a, 'gc> FnOnce(&mut UpdateContext<'a, 'gc>) -> R,
+        F: for<'a, 'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
-        self.gc_arena.borrow().mutate(|gc_context, gc_root| {
-            let mut root_data = gc_root.data.write(gc_context);
-            let mouse_hovered_object = root_data.mouse_hovered_object;
-            let mouse_pressed_object = root_data.mouse_pressed_object;
-            let focus_tracker = root_data.focus_tracker;
-
+        self.enter_arena_mut(|gc_context, gc_root, this| {
             #[allow(unused_variables)]
             let (
                 stage,
@@ -1863,56 +2185,56 @@ impl Player {
                 net_connections,
                 local_connections,
                 post_frame_callbacks,
+                mouse_data,
                 dynamic_root,
-            ) = root_data.update_context_params();
+            ) = gc_root.update_context_params();
 
             let mut update_context = UpdateContext {
-                player_version: self.player_version,
-                swf: &mut self.swf,
+                player_version: this.player_version,
+                swf: &mut this.swf,
                 library,
-                rng: &mut self.rng,
-                renderer: self.renderer.deref_mut(),
-                audio: self.audio.deref_mut(),
-                navigator: self.navigator.deref_mut(),
-                ui: self.ui.deref_mut(),
+                rng: &mut this.rng,
+                renderer: this.renderer.deref_mut(),
+                audio: this.audio.deref_mut(),
+                navigator: this.navigator.deref_mut(),
+                ui: this.ui.deref_mut(),
                 action_queue,
                 gc_context,
-                interner,
+                strings: StringContext::from_parts(gc_context, interner),
                 stage,
-                mouse_over_object: mouse_hovered_object,
-                mouse_down_object: mouse_pressed_object,
-                input: &self.input,
-                mouse_position: &self.mouse_position,
+                mouse_data,
+                input: &this.input,
+                mouse_position: &this.mouse_position,
                 drag_object,
-                player: self.self_reference.clone(),
+                player: this.self_reference.clone(),
                 load_manager,
-                system: &mut self.system,
-                page_url: &mut self.page_url,
-                instance_counter: &mut self.instance_counter,
-                storage: self.storage.deref_mut(),
-                log: self.log.deref_mut(),
-                video: self.video.deref_mut(),
+                system: &mut this.system,
+                page_url: &mut this.page_url,
+                instance_counter: &mut this.instance_counter,
+                storage: this.storage.deref_mut(),
+                log: this.log.deref_mut(),
+                video: this.video.deref_mut(),
                 avm1_shared_objects,
                 avm2_shared_objects,
                 unbound_text_fields,
                 timers,
                 current_context_menu,
-                needs_render: &mut self.needs_render,
+                needs_render: &mut this.needs_render,
                 avm1,
                 avm2,
                 external_interface,
-                start_time: self.start_time,
+                start_time: this.start_time,
                 update_start: Instant::now(),
-                max_execution_duration: self.max_execution_duration,
-                focus_tracker,
+                max_execution_duration: this.max_execution_duration,
+                focus_tracker: stage.focus_tracker(),
                 times_get_time_called: 0,
-                time_offset: &mut self.time_offset,
+                time_offset: &mut this.time_offset,
                 audio_manager,
-                frame_rate: &mut self.frame_rate,
-                forced_frame_rate: self.forced_frame_rate,
-                actions_since_timeout_check: &mut self.actions_since_timeout_check,
-                frame_phase: &mut self.frame_phase,
-                stub_tracker: &mut self.stub_tracker,
+                frame_rate: &mut this.frame_rate,
+                forced_frame_rate: this.forced_frame_rate,
+                actions_since_timeout_check: &mut this.actions_since_timeout_check,
+                frame_phase: &mut this.frame_phase,
+                stub_tracker: &mut this.stub_tracker,
                 stream_manager,
                 sockets,
                 net_connections,
@@ -1933,18 +2255,11 @@ impl Player {
                     .set_frame_rate(*update_context.frame_rate);
             }
 
-            self.current_frame = update_context
+            this.current_frame = update_context
                 .stage
                 .root_clip()
                 .and_then(|root| root.as_movie_clip())
                 .map(|clip| clip.current_frame());
-
-            // Hovered object may have been updated; copy it back to the GC root.
-            let mouse_hovered_object = update_context.mouse_over_object;
-            let mouse_pressed_object = update_context.mouse_down_object;
-            root_data.mouse_hovered_object = mouse_hovered_object;
-            root_data.mouse_pressed_object = mouse_pressed_object;
-
             ret
         })
     }
@@ -1976,7 +2291,7 @@ impl Player {
     /// hover state up to date, and running garbage collection.
     pub fn update<F, R>(&mut self, func: F) -> R
     where
-        F: for<'a, 'gc> FnOnce(&mut UpdateContext<'a, 'gc>) -> R,
+        F: for<'a, 'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
@@ -1990,7 +2305,7 @@ impl Player {
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
-        self.update_mouse_state(false, false);
+        self.update_mouse_state(&HashSet::new(), false, &mut false);
 
         // GC
         self.gc_arena.borrow_mut().collect_debt();
@@ -2001,7 +2316,7 @@ impl Player {
     pub fn flush_shared_objects(&mut self) {
         self.update(|context| {
             if let Some(mut avm1_activation) =
-                Activation::try_from_stub(context.reborrow(), ActivationIdentifier::root("[Flush]"))
+                Activation::try_from_stub(context, ActivationIdentifier::root("[Flush]"))
             {
                 for so in avm1_activation.context.avm1_shared_objects.clone().values() {
                     if let Err(e) =
@@ -2012,11 +2327,11 @@ impl Player {
                 }
             }
 
-            let mut avm2_activation = Avm2Activation::from_nothing(context.reborrow());
+            let mut avm2_activation = Avm2Activation::from_nothing(context);
             for so in avm2_activation.context.avm2_shared_objects.clone().values() {
                 if let Err(e) = crate::avm2::globals::flash::net::shared_object::flush(
                     &mut avm2_activation,
-                    *so,
+                    Avm2Value::Object(*so),
                     &[],
                 ) {
                     tracing::error!("Error flushing AVM2 shared object `{:?}`: {:?}", so, e);
@@ -2052,9 +2367,12 @@ impl Player {
         self.mutate_with_update_context(|context| context.avm1.has_mouse_listener())
     }
 
-    pub fn add_external_interface(&mut self, provider: Box<dyn ExternalInterfaceProvider>) {
+    pub fn set_external_interface_provider(
+        &mut self,
+        provider: Option<Box<dyn ExternalInterfaceProvider>>,
+    ) {
         self.mutate_with_update_context(|context| {
-            context.external_interface.add_provider(provider)
+            context.external_interface.set_provider(provider)
         });
     }
 
@@ -2105,7 +2423,7 @@ impl Player {
         self.mutate_with_update_context(|context| {
             context
                 .library
-                .register_device_font(context.gc_context, context.renderer, definition);
+                .register_device_font(context.gc(), context.renderer, definition);
         });
     }
 
@@ -2149,13 +2467,13 @@ pub struct PlayerBuilder {
     player_version: Option<u8>,
     player_runtime: PlayerRuntime,
     quality: StageQuality,
-    sandbox_type: SandboxType,
     page_url: Option<String>,
     frame_rate: Option<f64>,
-    external_interface_providers: Vec<Box<dyn ExternalInterfaceProvider>>,
+    external_interface_provider: Option<Box<dyn ExternalInterfaceProvider>>,
     fs_command_provider: Box<dyn FsCommandProvider>,
     #[cfg(feature = "known_stubs")]
     stub_report_output: Option<std::path::PathBuf>,
+    avm2_optimizer_enabled: bool,
 }
 
 impl PlayerBuilder {
@@ -2200,13 +2518,13 @@ impl PlayerBuilder {
             player_version: None,
             player_runtime: PlayerRuntime::default(),
             quality: StageQuality::High,
-            sandbox_type: SandboxType::LocalTrusted,
             page_url: None,
             frame_rate: None,
-            external_interface_providers: vec![],
+            external_interface_provider: None,
             fs_command_provider: Box::new(NullFsCommandProvider),
             #[cfg(feature = "known_stubs")]
             stub_report_output: None,
+            avm2_optimizer_enabled: true,
         }
     }
 
@@ -2221,6 +2539,13 @@ impl PlayerBuilder {
     #[inline]
     pub fn with_audio(mut self, audio: impl 'static + AudioBackend) -> Self {
         self.audio = Some(Box::new(audio));
+        self
+    }
+
+    /// Sets the audio backend of the player.
+    #[inline]
+    pub fn with_boxed_audio(mut self, audio: Box<dyn AudioBackend>) -> Self {
+        self.audio = Some(audio);
         self
     }
 
@@ -2254,8 +2579,8 @@ impl PlayerBuilder {
 
     /// Sets the storage backend of the player.
     #[inline]
-    pub fn with_storage(mut self, storage: impl 'static + StorageBackend) -> Self {
-        self.storage = Some(Box::new(storage));
+    pub fn with_storage(mut self, storage: Box<dyn StorageBackend>) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -2366,12 +2691,6 @@ impl PlayerBuilder {
         self
     }
 
-    /// Configures the security sandbox type (default is `SandboxType::LocalTrusted`)
-    pub fn with_sandbox_type(mut self, sandbox_type: SandboxType) -> Self {
-        self.sandbox_type = sandbox_type;
-        self
-    }
-
     // Configure the embedding page's URL (if applicable)
     pub fn with_page_url(mut self, page_url: Option<String>) -> Self {
         self.page_url = page_url;
@@ -2386,7 +2705,7 @@ impl PlayerBuilder {
 
     /// Adds an External Interface provider for movies to communicate with
     pub fn with_external_interface(mut self, provider: Box<dyn ExternalInterfaceProvider>) -> Self {
-        self.external_interface_providers.push(provider);
+        self.external_interface_provider = Some(provider);
         self
     }
 
@@ -2409,56 +2728,68 @@ impl PlayerBuilder {
         self
     }
 
+    pub fn with_avm2_optimizer_enabled(mut self, value: bool) -> Self {
+        self.avm2_optimizer_enabled = value;
+        self
+    }
+
     fn create_gc_root<'gc>(
-        gc_context: &'gc gc_arena::Mutation<'gc>,
+        gc_context: &'gc Mutation<'gc>,
         player_version: u8,
         player_runtime: PlayerRuntime,
         fullscreen: bool,
         fake_movie: Arc<SwfMovie>,
-        external_interface_providers: Vec<Box<dyn ExternalInterfaceProvider>>,
+        external_interface_provider: Option<Box<dyn ExternalInterfaceProvider>>,
         fs_command_provider: Box<dyn FsCommandProvider>,
     ) -> GcRoot<'gc> {
         let mut interner = AvmStringInterner::new(gc_context);
-        let mut init = GcContext {
-            gc_context,
-            interner: &mut interner,
+        let (avm1, avm2) = {
+            // SAFETY: Extending this borrow to `'gc` is sound, as the result of this
+            // block implements `Collect`, preventing any `&'gc _` outliving it.
+            let interner: &'gc mut _ = unsafe { &mut *(&mut interner as *mut _) };
+            let mut init = StringContext::from_parts(gc_context, interner);
+            (
+                Avm1::new(&mut init, player_version),
+                Avm2::new(&mut init, player_version, player_runtime),
+            )
         };
-        let dynamic_root = DynamicRootSet::new(gc_context);
+
+        let data = GcRootData {
+            audio_manager: AudioManager::new(),
+            action_queue: ActionQueue::new(),
+            avm1,
+            avm2,
+            interner,
+            current_context_menu: None,
+            drag_object: None,
+            external_interface: ExternalInterface::new(
+                external_interface_provider,
+                fs_command_provider,
+            ),
+            library: Library::empty(),
+            load_manager: LoadManager::new(),
+            mouse_data: MouseData {
+                hovered: None,
+                pressed: None,
+                right_pressed: None,
+                middle_pressed: None,
+            },
+            avm1_shared_objects: HashMap::new(),
+            avm2_shared_objects: HashMap::new(),
+            stage: Stage::empty(gc_context, fullscreen, fake_movie),
+            timers: Timers::new(),
+            unbound_text_fields: Vec::new(),
+            stream_manager: StreamManager::new(),
+            sockets: Sockets::empty(),
+            net_connections: NetConnections::default(),
+            local_connections: LocalConnections::empty(),
+            dynamic_root: DynamicRootSet::new(gc_context),
+            post_frame_callbacks: Vec::new(),
+        };
 
         GcRoot {
-            callstack: GcCell::new(gc_context, GcCallstack::default()),
-            data: GcCell::new(
-                gc_context,
-                GcRootData {
-                    audio_manager: AudioManager::new(),
-                    action_queue: ActionQueue::new(),
-                    avm1: Avm1::new(&mut init, player_version),
-                    avm2: Avm2::new(&mut init, player_version, player_runtime),
-                    interner,
-                    current_context_menu: None,
-                    drag_object: None,
-                    external_interface: ExternalInterface::new(
-                        external_interface_providers,
-                        fs_command_provider,
-                    ),
-                    focus_tracker: FocusTracker::new(gc_context),
-                    library: Library::empty(),
-                    load_manager: LoadManager::new(),
-                    mouse_hovered_object: None,
-                    mouse_pressed_object: None,
-                    avm1_shared_objects: HashMap::new(),
-                    avm2_shared_objects: HashMap::new(),
-                    stage: Stage::empty(gc_context, fullscreen, fake_movie),
-                    timers: Timers::new(),
-                    unbound_text_fields: Vec::new(),
-                    stream_manager: StreamManager::new(),
-                    sockets: Sockets::empty(),
-                    net_connections: NetConnections::default(),
-                    local_connections: LocalConnections::empty(),
-                    dynamic_root,
-                    post_frame_callbacks: Vec::new(),
-                },
-            ),
+            avm2_callstack: data.avm2.call_stack(),
+            data: GcRefLock::new(gc_context, data.into()),
         }
     }
 
@@ -2526,7 +2857,7 @@ impl PlayerBuilder {
                 actions_since_timeout_check: 0,
 
                 // Input
-                input: Default::default(),
+                input: InputManager::new(self.gamepad_button_mapping),
                 mouse_in_stage: true,
                 mouse_position: Point::ZERO,
                 mouse_cursor: MouseCursor::Arrow,
@@ -2534,19 +2865,22 @@ impl PlayerBuilder {
 
                 // Misc. state
                 rng: SmallRng::seed_from_u64(get_current_date_time().timestamp_millis() as u64),
-                system: SystemProperties::new(self.sandbox_type),
+                system: SystemProperties::new(),
                 page_url: self.page_url.clone(),
                 transform_stack: TransformStack::new(),
                 instance_counter: 0,
                 player_version,
                 player_runtime: self.player_runtime,
-                is_playing: self.autoplay,
+                run_state: if self.autoplay {
+                    RunState::Playing
+                } else {
+                    RunState::Suspended
+                },
                 needs_render: true,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
                 compatibility_rules: self.compatibility_rules.clone(),
-                gamepad_button_mapping: self.gamepad_button_mapping,
                 stub_tracker: StubCollection::new(),
                 #[cfg(feature = "egui")]
                 debug_ui: Default::default(),
@@ -2559,7 +2893,7 @@ impl PlayerBuilder {
                         self.player_runtime,
                         self.fullscreen,
                         fake_movie.clone(),
-                        self.external_interface_providers,
+                        self.external_interface_provider,
                         self.fs_command_provider,
                     )
                 }))),
@@ -2571,12 +2905,23 @@ impl PlayerBuilder {
 
         #[cfg(feature = "default_font")]
         {
-            let mut font_reader = swf::read::Reader::new(FALLBACK_DEVICE_FONT_TAG, 8);
-            let font_tag = font_reader
-                .read_define_font_2(3)
-                .expect("Built-in font should compile");
-            player_lock
-                .register_device_font(FontDefinition::SwfTag(font_tag, font_reader.encoding()));
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+
+            let mut data = Vec::new();
+            let mut decoder = DeflateDecoder::new(FALLBACK_DEVICE_FONT);
+            decoder
+                .read_to_end(&mut data)
+                .expect("default font decompression must succeed");
+
+            player_lock.register_device_font(FontDefinition::FontFile {
+                name: "Noto Sans".into(),
+                is_bold: false,
+                is_italic: false,
+                data,
+                index: 0,
+            });
+
             player_lock.set_default_font(DefaultFont::Sans, vec!["Noto Sans".to_string()]);
             player_lock.set_default_font(DefaultFont::Serif, vec!["Noto Sans".to_string()]);
             player_lock.set_default_font(DefaultFont::Typewriter, vec!["Noto Sans".to_string()]);
@@ -2591,11 +2936,21 @@ impl PlayerBuilder {
         }
 
         player_lock.mutate_with_update_context(|context| {
+            if !self.avm2_optimizer_enabled {
+                tracing::warn!(
+                    "AVM2 optimizer disabled, some bytecode verification will be missing"
+                );
+            }
+
+            context
+                .avm2
+                .set_optimizer_enabled(self.avm2_optimizer_enabled);
             Avm2::load_player_globals(context).expect("Unable to load AVM2 globals");
+
             let stage = context.stage;
             stage.set_align(context, self.align);
             stage.set_forced_align(context, self.forced_align);
-            stage.set_scale_mode(context, self.scale_mode);
+            stage.set_scale_mode(context, self.scale_mode, false);
             stage.set_forced_scale_mode(context, self.forced_scale_mode);
             stage.set_allow_fullscreen(context, self.allow_fullscreen);
             stage.post_instantiation(context, None, Instantiator::Movie, false);
@@ -2604,10 +2959,6 @@ impl PlayerBuilder {
             if let Some(stub_path) = self.stub_report_output {
                 crate::avm2::specification::capture_specification(context, &stub_path);
             }
-        });
-        player_lock.gc_arena.borrow().mutate(|context, root| {
-            let call_stack = root.data.read().avm2.call_stack();
-            root.callstack.write(context).avm2 = Some(call_stack);
         });
         player_lock.audio.set_frame_rate(frame_rate);
         player_lock.set_letterbox(self.letterbox);
@@ -2657,7 +3008,7 @@ pub struct DragObject<'gc> {
 }
 
 fn run_mouse_pick<'gc>(
-    context: &mut UpdateContext<'_, 'gc>,
+    context: &mut UpdateContext<'gc>,
     require_button_mode: bool,
 ) -> Option<InteractiveObject<'gc>> {
     context.stage.iter_render_list().rev().find_map(|level| {
@@ -2682,7 +3033,8 @@ fn run_mouse_pick<'gc>(
 }
 
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 pub enum PlayerRuntime {
     #[default]
     FlashPlayer,
@@ -2697,7 +3049,7 @@ impl FromStr for PlayerRuntime {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let player_runtime = match s {
             "air" => PlayerRuntime::AIR,
-            "flashPlayer" => PlayerRuntime::FlashPlayer,
+            "flash_player" => PlayerRuntime::FlashPlayer,
             _ => return Err(ParseEnumError),
         };
         Ok(player_runtime)

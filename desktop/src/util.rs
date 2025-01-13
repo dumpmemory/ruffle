@@ -1,14 +1,12 @@
-use crate::custom_event::RuffleEvent;
 use anyhow::{anyhow, Error};
 use gilrs::Button;
-use rfd::FileDialog;
 use ruffle_core::events::{GamepadButton, KeyCode, TextControlCode};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use url::Url;
 use winit::dpi::PhysicalSize;
 use winit::event::{KeyEvent, Modifiers};
-use winit::event_loop::EventLoop;
 use winit::keyboard::{Key, KeyLocation, NamedKey};
+use winit::window::Window;
 
 /// Converts a winit event to a Ruffle `TextControlCode`.
 /// Returns `None` if there is no match.
@@ -59,91 +57,75 @@ pub fn winit_to_ruffle_text_control(
 
 /// Convert a winit event into a Ruffle `KeyCode`.
 /// Return `KeyCode::Unknown` if there is no matching Flash key code.
-pub fn winit_to_ruffle_key_code(event: &KeyEvent) -> KeyCode {
-    match event.logical_key.as_ref() {
-        Key::Named(NamedKey::Backspace) => KeyCode::Backspace,
-        Key::Named(NamedKey::Tab) => KeyCode::Tab,
-        Key::Named(NamedKey::Enter) => KeyCode::Return,
-        Key::Named(NamedKey::Shift) => KeyCode::Shift,
-        Key::Named(NamedKey::Control) => KeyCode::Control,
-        Key::Named(NamedKey::Alt) => KeyCode::Alt,
-        Key::Named(NamedKey::CapsLock) => KeyCode::CapsLock,
-        Key::Named(NamedKey::Escape) => KeyCode::Escape,
-        Key::Named(NamedKey::Space) => KeyCode::Space,
-        Key::Character("0") if event.location == KeyLocation::Numpad => KeyCode::Numpad0,
-        Key::Character("1") if event.location == KeyLocation::Numpad => KeyCode::Numpad1,
-        Key::Character("2") if event.location == KeyLocation::Numpad => KeyCode::Numpad2,
-        Key::Character("3") if event.location == KeyLocation::Numpad => KeyCode::Numpad3,
-        Key::Character("4") if event.location == KeyLocation::Numpad => KeyCode::Numpad4,
-        Key::Character("5") if event.location == KeyLocation::Numpad => KeyCode::Numpad5,
-        Key::Character("6") if event.location == KeyLocation::Numpad => KeyCode::Numpad6,
-        Key::Character("7") if event.location == KeyLocation::Numpad => KeyCode::Numpad7,
-        Key::Character("8") if event.location == KeyLocation::Numpad => KeyCode::Numpad8,
-        Key::Character("9") if event.location == KeyLocation::Numpad => KeyCode::Numpad9,
-        Key::Character("0") => KeyCode::Key0,
-        Key::Character("1") => KeyCode::Key1,
-        Key::Character("2") => KeyCode::Key2,
-        Key::Character("3") => KeyCode::Key3,
-        Key::Character("4") => KeyCode::Key4,
-        Key::Character("5") => KeyCode::Key5,
-        Key::Character("6") => KeyCode::Key6,
-        Key::Character("7") => KeyCode::Key7,
-        Key::Character("8") => KeyCode::Key8,
-        Key::Character("9") => KeyCode::Key9,
-        Key::Character("a") => KeyCode::A,
-        Key::Character("b") => KeyCode::B,
-        Key::Character("c") => KeyCode::C,
-        Key::Character("d") => KeyCode::D,
-        Key::Character("e") => KeyCode::E,
-        Key::Character("f") => KeyCode::F,
-        Key::Character("g") => KeyCode::G,
-        Key::Character("h") => KeyCode::H,
-        Key::Character("i") => KeyCode::I,
-        Key::Character("j") => KeyCode::J,
-        Key::Character("k") => KeyCode::K,
-        Key::Character("l") => KeyCode::L,
-        Key::Character("m") => KeyCode::M,
-        Key::Character("n") => KeyCode::N,
-        Key::Character("o") => KeyCode::O,
-        Key::Character("p") => KeyCode::P,
-        Key::Character("q") => KeyCode::Q,
-        Key::Character("r") => KeyCode::R,
-        Key::Character("s") => KeyCode::S,
-        Key::Character("t") => KeyCode::T,
-        Key::Character("u") => KeyCode::U,
-        Key::Character("v") => KeyCode::V,
-        Key::Character("w") => KeyCode::W,
-        Key::Character("x") => KeyCode::X,
-        Key::Character("y") => KeyCode::Y,
-        Key::Character("z") => KeyCode::Z,
-        Key::Character(";") => KeyCode::Semicolon,
-        Key::Character("=") => KeyCode::Equals,
-        Key::Character(",") => KeyCode::Comma,
-        Key::Character("-") if event.location == KeyLocation::Numpad => KeyCode::NumpadMinus,
-        Key::Character("-") => KeyCode::Minus,
-        Key::Character(".") if event.location == KeyLocation::Numpad => KeyCode::NumpadPeriod,
-        Key::Character(".") => KeyCode::Period,
-        Key::Character("/") if event.location == KeyLocation::Numpad => KeyCode::NumpadSlash,
-        Key::Character("/") => KeyCode::Slash,
-        Key::Character("`") => KeyCode::Grave,
-        Key::Character("[") => KeyCode::LBracket,
-        Key::Character("\\") => KeyCode::Backslash,
-        Key::Character("]") => KeyCode::RBracket,
-        Key::Character("'") => KeyCode::Apostrophe,
-        Key::Character("*") => KeyCode::Multiply,
-        Key::Character("+") => KeyCode::Plus,
-        Key::Named(NamedKey::PageUp) => KeyCode::PgUp,
-        Key::Named(NamedKey::PageDown) => KeyCode::PgDown,
-        Key::Named(NamedKey::End) => KeyCode::End,
-        Key::Named(NamedKey::Home) => KeyCode::Home,
-        Key::Named(NamedKey::ArrowLeft) => KeyCode::Left,
-        Key::Named(NamedKey::ArrowUp) => KeyCode::Up,
-        Key::Named(NamedKey::ArrowRight) => KeyCode::Right,
-        Key::Named(NamedKey::ArrowDown) => KeyCode::Down,
-        Key::Named(NamedKey::Insert) => KeyCode::Insert,
-        Key::Named(NamedKey::Delete) => KeyCode::Delete,
-        Key::Named(NamedKey::Pause) => KeyCode::Pause,
-        Key::Named(NamedKey::ScrollLock) => KeyCode::ScrollLock,
+pub fn winit_to_ruffle_key_code(event: &KeyEvent) -> Option<KeyCode> {
+    // Note: it would be tempting to use event.key_without_modifiers() here, but FP
+    // does not care about keys without modifiers at all, it does its own mapping,
+    // so that on English UK, Shift+3 produces 16+163, not 16+51.
+
+    let is_numpad = event.location == KeyLocation::Numpad;
+    let key_code = match event.logical_key.as_ref() {
+        Key::Named(NamedKey::Backspace) => KeyCode::BACKSPACE,
+        Key::Named(NamedKey::Tab) => KeyCode::TAB,
+        Key::Named(NamedKey::Enter) => KeyCode::RETURN,
+        Key::Named(NamedKey::Shift) => KeyCode::SHIFT,
+        Key::Named(NamedKey::Control) => KeyCode::CONTROL,
+        Key::Named(NamedKey::Alt) => KeyCode::ALT,
+        // AltGr is ignored by FP
+        Key::Named(NamedKey::AltGraph) => return None,
+        Key::Named(NamedKey::CapsLock) => KeyCode::CAPS_LOCK,
+        Key::Named(NamedKey::Escape) => KeyCode::ESCAPE,
+        Key::Named(NamedKey::Space) => KeyCode::SPACE,
+        // Note: FP DOES care about modifiers for numpad keys,
+        // so that Shift+Numpad7 produces 16+36, not 16+103.
+        Key::Character("0") if is_numpad => KeyCode::NUMPAD0,
+        Key::Character("1") if is_numpad => KeyCode::NUMPAD1,
+        Key::Character("2") if is_numpad => KeyCode::NUMPAD2,
+        Key::Character("3") if is_numpad => KeyCode::NUMPAD3,
+        Key::Character("4") if is_numpad => KeyCode::NUMPAD4,
+        Key::Character("5") if is_numpad => KeyCode::NUMPAD5,
+        Key::Character("6") if is_numpad => KeyCode::NUMPAD6,
+        Key::Character("7") if is_numpad => KeyCode::NUMPAD7,
+        Key::Character("8") if is_numpad => KeyCode::NUMPAD8,
+        Key::Character("9") if is_numpad => KeyCode::NUMPAD9,
+        Key::Character("*") if is_numpad => KeyCode::MULTIPLY,
+        Key::Character("+") if is_numpad => KeyCode::PLUS,
+        Key::Character("-") if is_numpad => KeyCode::NUMPAD_MINUS,
+        Key::Character(".") if is_numpad => KeyCode::NUMPAD_PERIOD,
+        Key::Character("/") if is_numpad => KeyCode::NUMPAD_SLASH,
+        Key::Character("0") | Key::Character(")") => KeyCode::KEY0,
+        Key::Character("1") | Key::Character("!") => KeyCode::KEY1,
+        Key::Character("2") | Key::Character("@") => KeyCode::KEY2,
+        Key::Character("3") | Key::Character("#") => KeyCode::KEY3,
+        Key::Character("4") | Key::Character("$") => KeyCode::KEY4,
+        Key::Character("5") | Key::Character("%") => KeyCode::KEY5,
+        Key::Character("6") | Key::Character("^") => KeyCode::KEY6,
+        Key::Character("7") | Key::Character("&") => KeyCode::KEY7,
+        Key::Character("8") | Key::Character("*") => KeyCode::KEY8,
+        Key::Character("9") | Key::Character("(") => KeyCode::KEY9,
+        Key::Character(";") | Key::Character(":") => KeyCode::SEMICOLON,
+        Key::Character("=") | Key::Character("+") => KeyCode::EQUALS,
+        Key::Character(",") | Key::Character("<") => KeyCode::COMMA,
+        Key::Character("-") | Key::Character("_") => KeyCode::MINUS,
+        Key::Character(".") | Key::Character(">") => KeyCode::PERIOD,
+        Key::Character("/") | Key::Character("?") => KeyCode::SLASH,
+        Key::Character("`") | Key::Character("~") => KeyCode::GRAVE,
+        Key::Character("[") | Key::Character("{") => KeyCode::LBRACKET,
+        Key::Character("\\") | Key::Character("|") => KeyCode::BACKSLASH,
+        Key::Character("]") | Key::Character("}") => KeyCode::RBRACKET,
+        Key::Character("'") | Key::Character("\"") => KeyCode::APOSTROPHE,
+        Key::Named(NamedKey::PageUp) => KeyCode::PG_UP,
+        Key::Named(NamedKey::PageDown) => KeyCode::PG_DOWN,
+        Key::Named(NamedKey::End) => KeyCode::END,
+        Key::Named(NamedKey::Home) => KeyCode::HOME,
+        Key::Named(NamedKey::ArrowLeft) => KeyCode::LEFT,
+        Key::Named(NamedKey::ArrowUp) => KeyCode::UP,
+        Key::Named(NamedKey::ArrowRight) => KeyCode::RIGHT,
+        Key::Named(NamedKey::ArrowDown) => KeyCode::DOWN,
+        Key::Named(NamedKey::Insert) => KeyCode::INSERT,
+        Key::Named(NamedKey::Delete) => KeyCode::DELETE,
+        Key::Named(NamedKey::Pause) => KeyCode::PAUSE,
+        Key::Named(NamedKey::NumLock) => KeyCode::NUM_LOCK,
+        Key::Named(NamedKey::ScrollLock) => KeyCode::SCROLL_LOCK,
         Key::Named(NamedKey::F1) => KeyCode::F1,
         Key::Named(NamedKey::F2) => KeyCode::F2,
         Key::Named(NamedKey::F3) => KeyCode::F3,
@@ -168,8 +150,32 @@ pub fn winit_to_ruffle_key_code(event: &KeyEvent) -> KeyCode {
         Key::Named(NamedKey::F22) => KeyCode::F22,
         Key::Named(NamedKey::F23) => KeyCode::F23,
         Key::Named(NamedKey::F24) => KeyCode::F24,
-        _ => KeyCode::Unknown,
+        Key::Character(char) => {
+            // Handle alphabetic characters
+            alpha_to_ruffle_key_code(char).unwrap_or(KeyCode::UNKNOWN)
+        }
+        _ => KeyCode::UNKNOWN,
+    };
+    Some(key_code)
+}
+
+fn alpha_to_ruffle_key_code(char: &str) -> Option<KeyCode> {
+    let char = char.chars().next()?;
+
+    if char.is_ascii_alphabetic() {
+        // ASCII alphabetic characters are all mapped to
+        // their respective KeyCodes, which happen to have
+        // the same numerical value as uppercase characters.
+        return Some(KeyCode::from_code(char.to_ascii_uppercase() as u32));
     }
+
+    if !char.is_ascii() {
+        // Non-ASCII inputs have codes equal to their Unicode codes and yes,
+        // they overlap with other codes, so that typing '½' and '-' both produce 189.
+        return Some(KeyCode::from_code(char as u32));
+    }
+
+    None
 }
 
 pub fn gilrs_button_to_gamepad_button(button: Button) -> Option<GamepadButton> {
@@ -194,13 +200,13 @@ pub fn gilrs_button_to_gamepad_button(button: Button) -> Option<GamepadButton> {
     }
 }
 
-pub fn get_screen_size(event_loop: &EventLoop<RuffleEvent>) -> PhysicalSize<u32> {
+pub fn get_screen_size(window: &Window) -> PhysicalSize<u32> {
     let mut min_x = 0;
     let mut min_y = 0;
     let mut max_x = 0;
     let mut max_y = 0;
 
-    for monitor in event_loop.available_monitors() {
+    for monitor in window.available_monitors() {
         let size = monitor.size();
         let position = monitor.position();
         min_x = min_x.min(position.x);
@@ -232,39 +238,6 @@ pub fn parse_url(path: &Path) -> Result<Url, Error> {
     }
 }
 
-fn actually_pick_file(dir: Option<PathBuf>) -> Option<PathBuf> {
-    let mut dialog = FileDialog::new()
-        .add_filter("Flash Files", &["swf", "spl"])
-        .add_filter("All Files", &["*"])
-        .set_title("Load a Flash File");
-
-    if let Some(dir) = dir {
-        dialog = dialog.set_directory(dir);
-    }
-
-    dialog.pick_file()
-}
-
-// [NA] Horrible hacky workaround for https://github.com/rust-windowing/winit/issues/2291
-// We only need the workaround from within UI code, not when executing custom events
-// The workaround causes Ruffle to show as "not responding" on windows, so we don't use it if we don't need to
-#[cfg(windows)]
-pub fn pick_file(in_ui: bool, path: Option<PathBuf>) -> Option<PathBuf> {
-    if in_ui {
-        std::thread::spawn(move || actually_pick_file(path))
-            .join()
-            .ok()
-            .flatten()
-    } else {
-        actually_pick_file(path)
-    }
-}
-
-#[cfg(not(windows))]
-pub fn pick_file(_in_ui: bool, path: Option<PathBuf>) -> Option<PathBuf> {
-    actually_pick_file(path)
-}
-
 #[cfg(not(feature = "tracy"))]
 pub fn plot_stats_in_tracy(_instance: &wgpu::Instance) {}
 
@@ -281,27 +254,21 @@ pub fn plot_stats_in_tracy(instance: &wgpu::Instance) {
         .generate_report()
         .expect("reports should be available on desktop");
 
-    #[allow(unused_mut)]
-    let mut backend = None;
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        backend = backend.or(report.vulkan).or(report.gl);
-    }
-    #[cfg(windows)]
-    {
-        backend = backend.or(report.dx12);
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        backend = backend.or(report.metal);
-    }
-
-    if let Some(stats) = backend {
-        tracy.plot(BIND_GROUPS, stats.bind_groups.num_allocated as f64);
-        tracy.plot(BUFFERS, stats.buffers.num_allocated as f64);
-        tracy.plot(TEXTURES, stats.textures.num_allocated as f64);
-        tracy.plot(TEXTURE_VIEWS, stats.texture_views.num_allocated as f64);
-    }
+    tracy.plot(BIND_GROUPS, report.hub.bind_groups.num_allocated as f64);
+    tracy.plot(BUFFERS, report.hub.buffers.num_allocated as f64);
+    tracy.plot(TEXTURES, report.hub.textures.num_allocated as f64);
+    tracy.plot(TEXTURE_VIEWS, report.hub.texture_views.num_allocated as f64);
 
     tracy.frame_mark();
+}
+
+pub fn open_url(url: &Url) {
+    // TODO: This opens local files in the browser while flash opens them
+    // in the default program for the respective filetype.
+    // This especially includes mailto links. Ruffle opens the browser which opens
+    // the preferred program while flash opens the preferred program directly.
+    match webbrowser::open(url.as_str()) {
+        Ok(_output) => {}
+        Err(e) => tracing::error!("Could not open URL {}: {}", url.as_str(), e),
+    };
 }

@@ -1,4 +1,8 @@
-language-name = العربية (سوريا)
+language-name = العربية
 start = إبدأ
-browse = استعراض
-save = حفظ
+browse = تصفح
+save = احفظ
+cancel = ألغِ
+remove = أزِل
+enable = فعِّل
+disable = عطِّل

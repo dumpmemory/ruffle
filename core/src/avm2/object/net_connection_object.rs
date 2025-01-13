@@ -3,13 +3,10 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, ObjectPtr, TObject};
-use crate::avm2::value::Value;
 use crate::avm2::Error;
 use crate::net_connection::NetConnectionHandle;
-use gc_arena::barrier::unlock;
-use gc_arena::lock::RefLock;
-use gc_arena::{Collect, Gc, GcWeak, Mutation};
-use std::cell::{Cell, Ref, RefMut};
+use gc_arena::{Collect, Gc, GcWeak};
+use std::cell::Cell;
 use std::fmt;
 use std::fmt::Debug;
 
@@ -17,9 +14,9 @@ pub fn net_connection_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class).into();
+    let base = ScriptObjectData::new(class);
     let this: Object<'gc> = NetConnectionObject(Gc::new(
-        activation.context.gc_context,
+        activation.gc(),
         NetConnectionObjectData {
             base,
             handle: Cell::new(None),
@@ -40,27 +37,29 @@ pub struct NetConnectionObjectWeak<'gc>(pub GcWeak<'gc, NetConnectionObjectData<
 
 #[derive(Collect)]
 #[collect(no_drop)]
+#[repr(C, align(8))]
 pub struct NetConnectionObjectData<'gc> {
-    base: RefLock<ScriptObjectData<'gc>>,
-    #[collect(require_static)]
+    base: ScriptObjectData<'gc>,
+
     handle: Cell<Option<NetConnectionHandle>>,
 }
 
-impl<'gc> TObject<'gc> for NetConnectionObject<'gc> {
-    fn base(&self) -> Ref<ScriptObjectData<'gc>> {
-        self.0.base.borrow()
-    }
+const _: () = assert!(std::mem::offset_of!(NetConnectionObjectData, base) == 0);
+const _: () = assert!(
+    std::mem::align_of::<NetConnectionObjectData>() == std::mem::align_of::<ScriptObjectData>()
+);
 
-    fn base_mut(&self, mc: &Mutation<'gc>) -> RefMut<ScriptObjectData<'gc>> {
-        unlock!(Gc::write(mc, self.0), NetConnectionObjectData, base).borrow_mut()
+impl<'gc> TObject<'gc> for NetConnectionObject<'gc> {
+    fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
+        // SAFETY: Object data is repr(C), and a compile-time assert ensures
+        // that the ScriptObjectData stays at offset 0 of the struct- so the
+        // layouts are compatible
+
+        unsafe { Gc::cast(self.0) }
     }
 
     fn as_ptr(&self) -> *const ObjectPtr {
         Gc::as_ptr(self.0) as *const ObjectPtr
-    }
-
-    fn value_of(&self, _mc: &Mutation<'gc>) -> Result<Value<'gc>, Error<'gc>> {
-        Ok(Value::Object(Object::from(*self)))
     }
 
     fn as_net_connection(self) -> Option<NetConnectionObject<'gc>> {
@@ -68,7 +67,7 @@ impl<'gc> TObject<'gc> for NetConnectionObject<'gc> {
     }
 }
 
-impl<'gc> NetConnectionObject<'gc> {
+impl NetConnectionObject<'_> {
     pub fn handle(&self) -> Option<NetConnectionHandle> {
         self.0.handle.get()
     }
@@ -78,7 +77,7 @@ impl<'gc> NetConnectionObject<'gc> {
     }
 }
 
-impl<'gc> Debug for NetConnectionObject<'gc> {
+impl Debug for NetConnectionObject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NetConnectionObject")
     }

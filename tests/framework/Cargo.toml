@@ -11,23 +11,23 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-futures = "0.3.30"
-ruffle_core = { path = "../../core", features = ["deterministic", "timeline_debug", "avm_debug", "audio", "mp3", "default_font"] }
-ruffle_render = { path = "../../render" }
+ruffle_core = { path = "../../core", features = ["deterministic", "timeline_debug", "avm_debug", "audio", "mp3", "aac", "default_font", "serde"] }
+ruffle_render = { path = "../../render", features = ["serde"] }
 ruffle_input_format = { path = "../input-format" }
 ruffle_socket_format = { path = "../socket-format" }
 ruffle_video_software = { path = "../../video/software", optional = true }
-image = { version = "0.24.9", default-features = false, features  = ["png"] }
-regex = "1.10.3"
-url = "2.5.0"
-chrono = "0.4.35"
+ruffle_video_external = { path = "../../video/external", features = ["openh264"], optional = true }
+image = { workspace = true, features  = ["png"] }
+regex = "1.11.1"
+url = { workspace = true }
+chrono = { workspace = true }
 approx = "0.5.1"
-pretty_assertions = "1.4.0"
-serde = "1.0.197"
-toml = "0.8.10"
-anyhow = "1.0.80"
-async-channel = "2.2.0"
-vfs = "0.11.0"
+pretty_assertions = "1.4.1"
+serde = { workspace = true }
+toml = "0.8.16"
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+vfs = "0.12.0"
 percent-encoding = "2.3.1"
 
 [features]

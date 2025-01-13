@@ -4,19 +4,21 @@ use async_channel::{Receiver, Sender};
 use futures_util::future::Either;
 use futures_util::{future, SinkExt, StreamExt};
 use gloo_net::websocket::{futures::WebSocket, Message};
-use js_sys::{Array, Uint8Array};
+use js_sys::{Array, Promise, Uint8Array};
 use ruffle_core::backend::navigator::{
-    async_return, create_fetch_error, create_specific_fetch_error, ErrorResponse, NavigationMethod,
-    NavigatorBackend, OpenURLMode, OwnedFuture, Request, SuccessResponse,
+    async_return, create_fetch_error, create_specific_fetch_error, get_encoding, ErrorResponse,
+    NavigationMethod, NavigatorBackend, OwnedFuture, Request, SuccessResponse,
 };
 use ruffle_core::config::NetworkingAccessMode;
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
+use ruffle_core::swf::Encoding;
+use ruffle_core::Player;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tracing_subscriber::layer::Layered;
 use tracing_subscriber::Registry;
@@ -30,15 +32,32 @@ use web_sys::{
     RequestCredentials, RequestInit, Response as WebResponse,
 };
 
+/// The handling mode of links opening a new website.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum OpenUrlMode {
+    /// Allow all links to open a new website.
+    #[serde(rename = "allow")]
+    Allow,
+
+    /// A confirmation dialog opens with every link trying to open a new website.
+    #[serde(rename = "confirm")]
+    Confirm,
+
+    /// Deny all links to open a new website.
+    #[serde(rename = "deny")]
+    Deny,
+}
+
 pub struct WebNavigatorBackend {
     log_subscriber: Arc<Layered<WASMLayer, Registry>>,
     allow_script_access: bool,
     allow_networking: NetworkingAccessMode,
     upgrade_to_https: bool,
     base_url: Option<Url>,
-    open_url_mode: OpenURLMode,
+    open_url_mode: OpenUrlMode,
     socket_proxies: Vec<SocketProxy>,
     credential_allow_list: Vec<String>,
+    player: Weak<Mutex<Player>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,7 +68,7 @@ impl WebNavigatorBackend {
         upgrade_to_https: bool,
         base_url: Option<String>,
         log_subscriber: Arc<Layered<WASMLayer, Registry>>,
-        open_url_mode: OpenURLMode,
+        open_url_mode: OpenUrlMode,
         socket_proxies: Vec<SocketProxy>,
         credential_allow_list: Vec<String>,
     ) -> Self {
@@ -95,7 +114,13 @@ impl WebNavigatorBackend {
             open_url_mode,
             socket_proxies,
             credential_allow_list,
+            player: Weak::new(),
         }
+    }
+
+    /// We need to set the player after construction because the player is created after the navigator.
+    pub fn set_player(&mut self, player: Weak<Mutex<Player>>) {
+        self.player = player;
     }
 }
 
@@ -159,7 +184,7 @@ impl NavigatorBackend for WebNavigatorBackend {
         let window = window().expect("window()");
 
         if url.scheme() != "javascript" {
-            if self.open_url_mode == OpenURLMode::Confirm {
+            if self.open_url_mode == OpenUrlMode::Confirm {
                 let message = format!("The SWF file wants to open the website {}", &url);
                 // TODO: Add a checkbox with a GUI toolkit
                 let confirm = window
@@ -171,7 +196,7 @@ impl NavigatorBackend for WebNavigatorBackend {
                     );
                     return;
                 }
-            } else if self.open_url_mode == OpenURLMode::Deny {
+            } else if self.open_url_mode == OpenUrlMode::Deny {
                 tracing::warn!("SWF tried to open a website, but opening a website is not allowed");
                 return;
             }
@@ -260,15 +285,17 @@ impl NavigatorBackend for WebNavigatorBackend {
         };
 
         Box::pin(async move {
-            let mut init = RequestInit::new();
+            let init = RequestInit::new();
 
-            init.method(&request.method().to_string());
-            init.credentials(credentials);
+            init.set_method(&request.method().to_string());
+            init.set_credentials(credentials);
 
             if let Some((data, mime)) = request.body() {
+                let options = BlobPropertyBag::new();
+                options.set_type(mime);
                 let blob = Blob::new_with_buffer_source_sequence_and_options(
                     &Array::from_iter([Uint8Array::from(data.as_slice()).buffer()]),
-                    BlobPropertyBag::new().type_(mime),
+                    &options,
                 )
                 .map_err(|_| ErrorResponse {
                     url: url.to_string(),
@@ -280,7 +307,7 @@ impl NavigatorBackend for WebNavigatorBackend {
                     error: Error::FetchError("Got JS error".to_string()),
                 })?;
 
-                init.body(Some(&blob));
+                init.set_body(&blob);
             }
 
             let web_request = match WebRequest::new_with_str_and_init(url.as_str(), &init) {
@@ -355,8 +382,34 @@ impl NavigatorBackend for WebNavigatorBackend {
 
     fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
         let subscriber = self.log_subscriber.clone();
+        let player = self.player.clone();
+
         spawn_local(async move {
-            let _subscriber = tracing::subscriber::set_default(subscriber);
+            let _subscriber = tracing::subscriber::set_default(subscriber.clone());
+            if player
+                .upgrade()
+                .expect("Called spawn_future after player was dropped")
+                .try_lock()
+                .is_err()
+            {
+                // The player is locked - this can occur due to 'wasm-bindgen-futures' using
+                // 'queueMicroTask', which may result in one of our future's getting polled
+                // while we're still inside of our 'requestAnimationFrame' callback (e.g.
+                // when we call into javascript).
+                //
+                // When this happens, we 'reschedule' this future by waiting for a 'setTimeout'
+                // callback to be resolved. This will cause our future to get woken up from
+                // inside the 'setTimeout' JavaScript task (which is a new top-level call stack),
+                // outside of the 'requestAnimationFrame' callback, which will allow us to lock
+                // the Player.
+                let promise = Promise::new(&mut |resolve, _reject| {
+                    web_sys::window()
+                        .expect("window")
+                        .set_timeout_with_callback(&resolve)
+                        .expect("Failed to call setTimeout with dummy promise");
+                });
+                let _ = JsFuture::from(promise).await;
+            }
             if let Err(e) = future.await {
                 tracing::error!("Asynchronous error occurred: {}", e);
             }
@@ -479,6 +532,14 @@ impl SuccessResponse for WebResponseWrapper {
 
             Ok(body)
         })
+    }
+
+    fn text_encoding(&self) -> Option<&'static Encoding> {
+        if let Ok(Some(content_type)) = self.response.headers().get("Content-Type") {
+            get_encoding(&content_type)
+        } else {
+            None
+        }
     }
 
     fn status(&self) -> u16 {
