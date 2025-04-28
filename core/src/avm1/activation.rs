@@ -1788,7 +1788,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn action_play(&mut self) -> Result<FrameControl<'gc>, Error<'gc>> {
         if let Some(clip) = self.target_clip() {
             if let Some(clip) = clip.as_movie_clip() {
-                clip.play(self.context)
+                clip.play()
             } else {
                 avm_warn!(self, "Play: Target is not a MovieClip");
             }
@@ -2210,7 +2210,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.context.stage.set_quality(self.context, new_quality);
         self.context
             .stage
-            .set_use_bitmap_downsampling(self.gc(), use_bitmap_downsamping);
+            .set_use_bitmap_downsampling(use_bitmap_downsamping);
         Ok(FrameControl::Continue)
     }
 

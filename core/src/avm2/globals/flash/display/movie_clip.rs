@@ -219,7 +219,7 @@ pub fn get_enabled<'gc>(
 }
 
 pub fn set_enabled<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
@@ -231,7 +231,7 @@ pub fn set_enabled<'gc>(
     {
         let enabled = args.get_bool(0);
 
-        mc.set_avm2_enabled(activation.context, enabled);
+        mc.set_avm2_enabled(enabled);
     }
 
     Ok(Value::Undefined)
@@ -350,7 +350,7 @@ pub fn goto_and_play<'gc>(
         .as_display_object()
         .and_then(|dobj| dobj.as_movie_clip())
     {
-        mc.set_programmatically_played(activation.gc());
+        mc.set_programmatically_played();
         goto_frame(activation, mc, args, false)?;
     }
 
@@ -460,7 +460,7 @@ pub fn stop<'gc>(
 
 /// Implements `play`.
 pub fn play<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
@@ -470,8 +470,8 @@ pub fn play<'gc>(
         .as_display_object()
         .and_then(|dobj| dobj.as_movie_clip())
     {
-        mc.set_programmatically_played(activation.gc());
-        mc.play(activation.context);
+        mc.set_programmatically_played();
+        mc.play();
     }
 
     Ok(Value::Undefined)

@@ -777,7 +777,7 @@ impl DisplayObjectWindow {
                 ui.label("Controls");
                 ui.horizontal(|ui| {
                     if ui.button("Play").clicked() {
-                        object.play(context);
+                        object.play();
                     }
                     if ui.button("Stop").clicked() {
                         object.stop(context);
@@ -895,7 +895,7 @@ impl DisplayObjectWindow {
                 let mut new_stage_focus_rect = object.stage_focus_rect();
                 ui.checkbox(&mut new_stage_focus_rect, "Enabled");
                 if new_stage_focus_rect != object.stage_focus_rect() {
-                    object.set_stage_focus_rect(context.gc(), new_stage_focus_rect);
+                    object.set_stage_focus_rect(new_stage_focus_rect);
                 }
                 ui.end_row();
 

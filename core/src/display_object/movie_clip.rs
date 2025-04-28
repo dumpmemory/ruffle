@@ -43,7 +43,7 @@ use gc_arena::{Collect, Gc, GcCell, GcWeakCell, Mutation};
 use ruffle_macros::istr;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -159,22 +159,21 @@ pub struct MovieClipData<'gc> {
     #[collect(require_static)]
     clip_event_flags: ClipEventFlag,
     frame_scripts: Vec<Option<Avm2Object<'gc>>>,
-    #[collect(require_static)]
-    flags: MovieClipFlags,
+    flags: Cell<MovieClipFlags>,
     /// This is lazily allocated on demand, to make `MovieClipData` smaller in the common case.
     #[collect(require_static)]
     drawing: Option<Box<Drawing>>,
-    avm2_enabled: bool,
+    avm2_enabled: Cell<bool>,
 
     /// Show a hand cursor when the clip is in button mode.
-    avm2_use_hand_cursor: bool,
+    avm2_use_hand_cursor: Cell<bool>,
 
     /// A DisplayObject (doesn't need to be visible) to use for hit tests instead of this clip.
     hit_area: Option<DisplayObject<'gc>>,
 
     /// Force enable button mode, which causes all mouse-related events to
     /// trigger on this clip rather than any input-eligible children.
-    button_mode: bool,
+    button_mode: Cell<bool>,
     last_queued_script_frame: Option<FrameNumber>,
     queued_script_frame: Option<FrameNumber>,
     queued_goto_frame: Option<FrameNumber>,
@@ -215,11 +214,11 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
-                flags: MovieClipFlags::empty(),
+                flags: Cell::new(MovieClipFlags::empty()),
                 drawing: None,
-                avm2_enabled: true,
-                avm2_use_hand_cursor: true,
-                button_mode: false,
+                avm2_enabled: Cell::new(true),
+                avm2_use_hand_cursor: Cell::new(true),
+                button_mode: Cell::new(false),
                 last_queued_script_frame: None,
                 queued_script_frame: None,
                 queued_goto_frame: None,
@@ -258,11 +257,11 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
-                flags: MovieClipFlags::empty(),
+                flags: Cell::new(MovieClipFlags::empty()),
                 drawing: None,
-                avm2_enabled: true,
-                avm2_use_hand_cursor: true,
-                button_mode: false,
+                avm2_enabled: Cell::new(true),
+                avm2_use_hand_cursor: Cell::new(true),
+                button_mode: Cell::new(false),
                 last_queued_script_frame: None,
                 queued_script_frame: None,
                 queued_goto_frame: None,
@@ -304,11 +303,11 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
-                flags: MovieClipFlags::PLAYING,
+                flags: Cell::new(MovieClipFlags::PLAYING),
                 drawing: None,
-                avm2_enabled: true,
-                avm2_use_hand_cursor: true,
-                button_mode: false,
+                avm2_enabled: Cell::new(true),
+                avm2_use_hand_cursor: Cell::new(true),
+                button_mode: Cell::new(false),
                 last_queued_script_frame: None,
                 queued_script_frame: None,
                 queued_goto_frame: None,
@@ -360,11 +359,11 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
-                flags: MovieClipFlags::PLAYING,
+                flags: Cell::new(MovieClipFlags::PLAYING),
                 drawing: None,
-                avm2_enabled: true,
-                avm2_use_hand_cursor: true,
-                button_mode: false,
+                avm2_enabled: Cell::new(true),
+                avm2_use_hand_cursor: Cell::new(true),
+                button_mode: Cell::new(false),
                 last_queued_script_frame: None,
                 queued_script_frame: None,
                 queued_goto_frame: None,
@@ -427,11 +426,11 @@ impl<'gc> MovieClip<'gc> {
                 clip_event_handlers: Vec::new(),
                 clip_event_flags: ClipEventFlag::empty(),
                 frame_scripts: Vec::new(),
-                flags: MovieClipFlags::PLAYING,
+                flags: Cell::new(MovieClipFlags::PLAYING),
                 drawing: None,
-                avm2_enabled: true,
-                avm2_use_hand_cursor: true,
-                button_mode: false,
+                avm2_enabled: Cell::new(true),
+                avm2_use_hand_cursor: Cell::new(true),
+                button_mode: Cell::new(false),
                 last_queued_script_frame: None,
                 queued_script_frame: None,
                 queued_goto_frame: None,
@@ -497,7 +496,7 @@ impl<'gc> MovieClip<'gc> {
             ),
         );
         mc.tag_stream_pos = 0;
-        mc.flags = MovieClipFlags::PLAYING;
+        mc.flags.set(MovieClipFlags::PLAYING);
         mc.base.base.set_is_root(is_root);
         mc.current_frame = 0;
         mc.audio_stream = None;
@@ -505,8 +504,8 @@ impl<'gc> MovieClip<'gc> {
         drop(mc);
     }
 
-    pub fn set_initialized(self, gc_context: &Mutation<'gc>) {
-        self.0.write(gc_context).set_initialized(true);
+    pub fn set_initialized(self) {
+        self.0.read().set_initialized(true);
     }
 
     /// Tries to fire events from our `LoaderInfo` object if we're ready - returns
@@ -986,8 +985,8 @@ impl<'gc> MovieClip<'gc> {
         self.0.write(gc_context).drop_target = drop_target;
     }
 
-    pub fn set_programmatically_played(self, mc: &Mutation<'gc>) {
-        self.0.write(mc).set_programmatically_played()
+    pub fn set_programmatically_played(self) {
+        self.0.read().set_programmatically_played()
     }
 
     pub fn next_frame(self, context: &mut UpdateContext<'gc>) {
@@ -996,8 +995,8 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    pub fn play(self, context: &mut UpdateContext<'gc>) {
-        self.0.write(context.gc()).play()
+    pub fn play(self) {
+        self.0.read().play()
     }
 
     pub fn prev_frame(self, context: &mut UpdateContext<'gc>) {
@@ -1033,7 +1032,7 @@ impl<'gc> MovieClip<'gc> {
         if stop {
             self.stop(context);
         } else {
-            self.play(context);
+            self.play();
         }
 
         // Clamp frame number in bounds.
@@ -1045,8 +1044,7 @@ impl<'gc> MovieClip<'gc> {
             if self
                 .0
                 .read()
-                .flags
-                .contains(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
+                .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
             {
                 // AVM2 does not allow a clip to see while it is executing a frame script.
                 // The goto is instead queued and run once the frame script is completed.
@@ -2252,11 +2250,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn avm2_enabled(self) -> bool {
-        self.0.read().avm2_enabled
+        self.0.read().avm2_enabled.get()
     }
 
-    pub fn set_avm2_enabled(self, context: &mut UpdateContext<'gc>, enabled: bool) {
-        self.0.write(context.gc()).avm2_enabled = enabled;
+    pub fn set_avm2_enabled(self, enabled: bool) {
+        self.0.read().avm2_enabled.set(enabled);
     }
 
     fn use_hand_cursor(self, context: &mut UpdateContext<'gc>) -> bool {
@@ -2268,11 +2266,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn avm2_use_hand_cursor(self) -> bool {
-        self.0.read().avm2_use_hand_cursor
+        self.0.read().avm2_use_hand_cursor.get()
     }
 
-    pub fn set_avm2_use_hand_cursor(self, context: &mut UpdateContext<'gc>, use_hand_cursor: bool) {
-        self.0.write(context.gc()).avm2_use_hand_cursor = use_hand_cursor;
+    pub fn set_avm2_use_hand_cursor(self, use_hand_cursor: bool) {
+        self.0.read().avm2_use_hand_cursor.set(use_hand_cursor);
     }
 
     pub fn hit_area(self) -> Option<DisplayObject<'gc>> {
@@ -2292,11 +2290,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn forced_button_mode(self) -> bool {
-        self.0.read().button_mode
+        self.0.read().button_mode.get()
     }
 
-    pub fn set_forced_button_mode(self, context: &mut UpdateContext<'gc>, button_mode: bool) {
-        self.0.write(context.gc()).button_mode = button_mode;
+    pub fn set_forced_button_mode(self, button_mode: bool) {
+        self.0.read().button_mode.set(button_mode);
     }
 
     pub fn drawing_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, Drawing> {
@@ -2575,7 +2573,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 false
             };
 
-            self.0.write(context.gc()).unset_loop_queued();
+            self.0.read().unset_loop_queued();
 
             if needs_construction {
                 self.construct_as_avm2_object(context);
@@ -2591,8 +2589,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 let running_construct_frame = self
                     .0
                     .read()
-                    .flags
-                    .contains(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
+                    .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 // The supercall constructor for display objects is responsible
                 // for triggering construct_frame on frame 1.
                 for child in self.iter_render_list() {
@@ -2608,10 +2605,10 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn run_frame_avm1(&self, context: &mut UpdateContext<'gc>) {
         if !self.movie().is_action_script_3() {
             // Run my load/enterFrame clip event.
-            let is_load_frame = !self.0.read().flags.contains(MovieClipFlags::INITIALIZED);
+            let is_load_frame = !self.0.read().contains_flag(MovieClipFlags::INITIALIZED);
             if is_load_frame {
                 self.event_dispatch(context, ClipEvent::Load);
-                self.0.write(context.gc()).set_initialized(true);
+                self.0.read().set_initialized(true);
             } else {
                 self.event_dispatch(context, ClipEvent::EnterFrame);
             }
@@ -2636,10 +2633,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 // whole movie again. If a goto is attempting to queue frame
                 // scripts on us AGAIN, we should allow the current stack to
                 // wind down before handling that.
-                if !write
-                    .flags
-                    .contains(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
-                {
+                if !write.contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT) {
                     let is_fresh_frame =
                         write.queued_script_frame != write.last_queued_script_frame;
 
@@ -2649,9 +2643,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         {
                             write.last_queued_script_frame = Some(frame_id);
                             write.queued_script_frame = None;
-                            write
-                                .flags
-                                .insert(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT);
+                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
 
                             drop(write);
 
@@ -2676,9 +2668,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                             }
                             write = self.0.write(context.gc());
 
-                            write
-                                .flags
-                                .remove(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT);
+                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
                         }
                     }
                 }
@@ -2794,17 +2784,15 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     ) {
         if self
             .0
-            .write(context.gc())
-            .flags
-            .contains(MovieClipFlags::POST_INSTANTIATED)
+            .read()
+            .contains_flag(MovieClipFlags::POST_INSTANTIATED)
         {
             // Ensure that the same clip doesn't get post-instantiated twice.
             return;
         }
         self.0
-            .write(context.gc())
-            .flags
-            .insert(MovieClipFlags::POST_INSTANTIATED);
+            .read()
+            .set_flag(MovieClipFlags::POST_INSTANTIATED, true);
 
         self.set_default_instance_name(context);
 
@@ -3333,6 +3321,16 @@ impl<'gc> MovieClipData<'gc> {
         self.shared.id
     }
 
+    fn set_flag(&self, flag: MovieClipFlags, value: bool) {
+        let mut flags = self.flags.get();
+        flags.set(flag, value);
+        self.flags.set(flags);
+    }
+
+    fn contains_flag(&self, flag: MovieClipFlags) -> bool {
+        self.flags.get().contains(flag)
+    }
+
     fn current_frame(&self) -> FrameNumber {
         self.current_frame
     }
@@ -3346,34 +3344,34 @@ impl<'gc> MovieClipData<'gc> {
     }
 
     fn playing(&self) -> bool {
-        self.flags.contains(MovieClipFlags::PLAYING)
+        self.contains_flag(MovieClipFlags::PLAYING)
     }
 
-    fn set_playing(&mut self, value: bool) {
-        self.flags.set(MovieClipFlags::PLAYING, value);
+    fn set_playing(&self, value: bool) {
+        self.set_flag(MovieClipFlags::PLAYING, value);
     }
 
     fn programmatically_played(&self) -> bool {
-        self.flags.contains(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
+        self.contains_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
     }
 
-    fn set_programmatically_played(&mut self) {
-        self.flags |= MovieClipFlags::PROGRAMMATICALLY_PLAYED;
+    fn set_programmatically_played(&self) {
+        self.set_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED, true);
     }
 
     fn loop_queued(&self) -> bool {
-        self.flags.contains(MovieClipFlags::LOOP_QUEUED)
+        self.contains_flag(MovieClipFlags::LOOP_QUEUED)
     }
 
-    fn set_loop_queued(&mut self) {
-        self.flags |= MovieClipFlags::LOOP_QUEUED;
+    fn set_loop_queued(&self) {
+        self.set_flag(MovieClipFlags::LOOP_QUEUED, true);
     }
 
-    fn unset_loop_queued(&mut self) {
-        self.flags.remove(MovieClipFlags::LOOP_QUEUED);
+    fn unset_loop_queued(&self) {
+        self.set_flag(MovieClipFlags::LOOP_QUEUED, false);
     }
 
-    fn play(&mut self) {
+    fn play(&self) {
         // Can only play clips with multiple frames.
         if self.total_frames() > 1 {
             self.set_playing(true);
@@ -3439,12 +3437,12 @@ impl<'gc> MovieClipData<'gc> {
     }
 
     fn initialized(&self) -> bool {
-        self.flags.contains(MovieClipFlags::INITIALIZED)
+        self.contains_flag(MovieClipFlags::INITIALIZED)
     }
 
-    fn set_initialized(&mut self, value: bool) -> bool {
-        let ret = self.flags.contains(MovieClipFlags::INITIALIZED);
-        self.flags.set(MovieClipFlags::INITIALIZED, value);
+    fn set_initialized(&self, value: bool) -> bool {
+        let ret = self.contains_flag(MovieClipFlags::INITIALIZED);
+        self.set_flag(MovieClipFlags::INITIALIZED, value);
         !ret
     }
 
@@ -4694,9 +4692,7 @@ impl<'gc, 'a> MovieClip<'gc> {
         // if parent SWF is missing SetBackgroundColor tag.
         let background_color = reader.read_rgb()?;
         if context.stage.background_color().is_none() {
-            context
-                .stage
-                .set_background_color(context.gc(), Some(background_color));
+            context.stage.set_background_color(Some(background_color));
         }
         Ok(())
     }
@@ -4740,11 +4736,10 @@ impl<'gc, 'a> MovieClip<'gc> {
         Ok(())
     }
 
-    pub fn set_constructing_frame(&self, val: bool, mc: &Mutation<'gc>) {
+    pub fn set_constructing_frame(&self, val: bool) {
         self.0
-            .write(mc)
-            .flags
-            .set(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
+            .read()
+            .set_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
     }
 }
 
