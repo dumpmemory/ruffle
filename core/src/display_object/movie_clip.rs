@@ -1,4 +1,6 @@
 //! `MovieClip` display object and support code.
+use crate::avm1::Avm1;
+use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::avm1::{NativeObject as Avm1NativeObject, Object as Avm1Object, Value as Avm1Value};
 use crate::avm2::object::LoaderInfoObject;
 use crate::avm2::object::LoaderStream;
@@ -11,11 +13,6 @@ use crate::avm2::{
 use crate::backend::audio::{AudioManager, SoundInstanceHandle};
 use crate::backend::navigator::Request;
 use crate::backend::ui::MouseCursor;
-use crate::frame_lifecycle::run_inner_goto_frame;
-use bitflags::bitflags;
-
-use crate::avm1::Avm1;
-use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::binary_data::BinaryData;
 use crate::character::{Character, CompressedBitmap};
 use crate::context::{ActionType, RenderContext, UpdateContext};
@@ -30,6 +27,7 @@ use crate::display_object::{
 use crate::drawing::Drawing;
 use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult};
 use crate::font::{Font, FontType};
+use crate::frame_lifecycle::{run_inner_goto_frame, FramePhase};
 use crate::library::MovieLibrary;
 use crate::limits::ExecutionLimit;
 use crate::loader::{self, ContentType};
@@ -39,11 +37,13 @@ use crate::streams::NetStream;
 use crate::string::{AvmString, SwfStrExt as _, WStr, WString};
 use crate::tag_utils::{self, ControlFlow, DecodeResult, Error, SwfMovie, SwfSlice, SwfStream};
 use crate::vminterface::{AvmObject, Instantiator};
+use bitflags::bitflags;
 use core::fmt;
 use gc_arena::barrier::unlock;
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, GcCell, GcWeakCell, Mutation};
 use ruffle_macros::istr;
+use ruffle_render::perspective_projection::PerspectiveProjection;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -178,7 +178,8 @@ pub struct MovieClipData<'gc> {
     /// trigger on this clip rather than any input-eligible children.
     button_mode: Cell<bool>,
     last_queued_script_frame: Option<FrameNumber>,
-    queued_script_frame: Option<FrameNumber>,
+    queued_script_frame: FrameNumber,
+    has_pending_script: bool,
     queued_goto_frame: Option<FrameNumber>,
     drop_target: Option<DisplayObject<'gc>>,
 
@@ -215,7 +216,8 @@ impl<'gc> MovieClipData<'gc> {
             avm2_use_hand_cursor: Cell::new(true),
             button_mode: Cell::new(false),
             last_queued_script_frame: None,
-            queued_script_frame: None,
+            queued_script_frame: 0,
+            has_pending_script: false,
             queued_goto_frame: None,
             drop_target: None,
             hit_area: None,
@@ -695,6 +697,10 @@ impl<'gc> MovieClip<'gc> {
         } else {
             self.play();
         }
+
+        // When performing goto, frame scripts behave the same as when entering a new frame
+        // so no separate cleanup is performed on ones registered during frame script phase
+        context.frame_script_cleanup_queue.clear();
 
         // Clamp frame number in bounds.
         let frame = frame.max(1);
@@ -1240,7 +1246,7 @@ impl<'gc> MovieClip<'gc> {
             write.current_frame += 1;
         }
 
-        write.queued_script_frame = Some(write.current_frame);
+        write.queued_script_frame = write.current_frame;
         if write.last_queued_script_frame != Some(write.current_frame) {
             // We explicitly clear this variable since AS3 may later GOTO back
             // to the already-ran frame. Since the frame number *has* changed
@@ -1839,7 +1845,9 @@ impl<'gc> MovieClip<'gc> {
         callable: Option<Avm2Object<'gc>>,
         context: &mut UpdateContext<'gc>,
     ) {
-        let frame_scripts = &mut self.0.write(context.gc()).frame_scripts;
+        let mut write = self.0.write(context.gc());
+        let current_frame = write.current_frame;
+        let frame_scripts = &mut write.frame_scripts;
 
         let index = frame_id as usize;
         if let Some(callable) = callable {
@@ -1847,6 +1855,16 @@ impl<'gc> MovieClip<'gc> {
                 frame_scripts.resize(index + 1, None);
             }
             frame_scripts[index] = Some(callable);
+            if frame_id == current_frame {
+                if *context.frame_phase == FramePhase::FrameScripts {
+                    context.frame_script_cleanup_queue.push_back(self);
+                } else {
+                    // Ensure newly registered frame scripts are executed,
+                    // even if the frame is repeated due to goto.
+                    write.last_queued_script_frame = None;
+                    write.has_pending_script = true;
+                }
+            }
         } else if frame_scripts.len() > index {
             frame_scripts[index] = None;
         }
@@ -2139,6 +2157,76 @@ impl<'gc> MovieClip<'gc> {
             }
         }
     }
+
+    pub fn run_frame_script_cleanup(context: &mut UpdateContext<'gc>) {
+        while let Some(clip) = context.frame_script_cleanup_queue.pop_front() {
+            clip.0.write(context.gc()).has_pending_script = true;
+            clip.0.write(context.gc()).last_queued_script_frame = None;
+            clip.run_local_frame_scripts(context);
+        }
+    }
+
+    fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        let mut write = self.0.write(context.gc());
+        let avm2_object = write.object.and_then(|o| o.as_avm2_object());
+
+        if let Some(avm2_object) = avm2_object {
+            if write.has_pending_script {
+                let frame_id = write.queued_script_frame;
+                // If we are already executing frame scripts, then we shouldn't
+                // run frame scripts recursively. This is because AVM2 can run
+                // gotos, which will both queue and run frame scripts for the
+                // whole movie again. If a goto is attempting to queue frame
+                // scripts on us AGAIN, we should allow the current stack to
+                // wind down before handling that.
+                if !write.contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT) {
+                    let is_fresh_frame =
+                        write.last_queued_script_frame != Some(write.queued_script_frame);
+
+                    if is_fresh_frame {
+                        if let Some(Some(callable)) =
+                            write.frame_scripts.get(frame_id as usize).cloned()
+                        {
+                            write.last_queued_script_frame = Some(frame_id);
+                            write.has_pending_script = false;
+                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
+
+                            drop(write);
+
+                            let movie = self.movie();
+                            let domain = context
+                                .library
+                                .library_for_movie(movie)
+                                .unwrap()
+                                .avm2_domain();
+
+                            if let Err(e) = Avm2::run_stack_frame_for_callable(
+                                callable,
+                                avm2_object.into(),
+                                &[],
+                                domain,
+                                context,
+                            ) {
+                                tracing::error!(
+                                    "Error occurred when running AVM2 frame script: {}",
+                                    e
+                                );
+                            }
+                            write = self.0.write(context.gc());
+
+                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        let goto_frame = write.queued_goto_frame.take();
+        drop(write);
+        if let Some(frame) = goto_frame {
+            self.run_goto(context, frame, false);
+        }
+    }
 }
 
 impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
@@ -2260,6 +2348,14 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 }
             }
         }
+
+        // Check for frame-scripts before starting the frame-script phase,
+        // to differentiate the pre-existing scripts from those introduced during frame-script phase.
+        let mut write = self.0.write(context.gc());
+        write.has_pending_script = write
+            .frame_scripts
+            .get(write.current_frame as usize)
+            .is_some();
     }
 
     fn run_frame_avm1(&self, context: &mut UpdateContext<'gc>) {
@@ -2282,64 +2378,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        let mut write = self.0.write(context.gc());
-        let avm2_object = write.object.and_then(|o| o.as_avm2_object());
-
-        if let Some(avm2_object) = avm2_object {
-            if let Some(frame_id) = write.queued_script_frame {
-                // If we are already executing frame scripts, then we shouldn't
-                // run frame scripts recursively. This is because AVM2 can run
-                // gotos, which will both queue and run frame scripts for the
-                // whole movie again. If a goto is attempting to queue frame
-                // scripts on us AGAIN, we should allow the current stack to
-                // wind down before handling that.
-                if !write.contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT) {
-                    let is_fresh_frame =
-                        write.queued_script_frame != write.last_queued_script_frame;
-
-                    if is_fresh_frame {
-                        if let Some(Some(callable)) =
-                            write.frame_scripts.get(frame_id as usize).cloned()
-                        {
-                            write.last_queued_script_frame = Some(frame_id);
-                            write.queued_script_frame = None;
-                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
-
-                            drop(write);
-
-                            let movie = self.movie();
-                            let domain = context
-                                .library
-                                .library_for_movie(movie)
-                                .unwrap()
-                                .avm2_domain();
-
-                            if let Err(e) = Avm2::run_stack_frame_for_callable(
-                                callable,
-                                avm2_object.into(),
-                                &[],
-                                domain,
-                                context,
-                            ) {
-                                tracing::error!(
-                                    "Error occurred when running AVM2 frame script: {}",
-                                    e
-                                );
-                            }
-                            write = self.0.write(context.gc());
-
-                            write.set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
-                        }
-                    }
-                }
-            }
-        }
-
-        let goto_frame = write.queued_goto_frame.take();
-        drop(write);
-        if let Some(frame) = goto_frame {
-            self.run_goto(context, frame, false);
-        }
+        self.run_local_frame_scripts(context);
 
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
@@ -2485,6 +2524,34 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         self.0.write(context.gc()).object = Some(to.into());
         if self.parent().is_none() {
             context.avm2.add_orphan_obj((*self).into());
+        }
+    }
+
+    fn set_perspective_projection(
+        &self,
+        gc_context: &Mutation<'gc>,
+        mut perspective_projection: Option<PerspectiveProjection>,
+    ) {
+        if perspective_projection.is_none() && self.is_root() {
+            // `root` doesn't allow null PerspectiveProjection.
+            perspective_projection = Some(PerspectiveProjection {
+                field_of_view: 55.0,
+                center: (
+                    self.movie().width().to_pixels() / 2.0,
+                    self.movie().height().to_pixels() / 2.0,
+                ),
+            });
+        }
+
+        if self
+            .base_mut(gc_context)
+            .set_perspective_projection(perspective_projection)
+        {
+            if let Some(parent) = self.parent() {
+                // Self-transform changes are automatically handled,
+                // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
+                parent.invalidate_cached_bitmap(gc_context);
+            }
         }
     }
 
