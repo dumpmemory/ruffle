@@ -179,7 +179,7 @@ pub enum Error {
     #[error("Other Loader spawned as Movie unloader")]
     NotMovieUnloader,
 
-    #[error("HTTP Status is not OK: {0} redirected: {1}")]
+    #[error("HTTP Status is not OK: {0} status: {1} redirected: {2} length: {3}")]
     HttpNotOk(String, u16, bool, u64),
 
     /// The domain could not be resolved, either because it is invalid or a DNS error occurred
@@ -1064,16 +1064,16 @@ impl<'gc> Loader<'gc> {
                     .lock()
                     .unwrap()
                     .ui()
-                    .display_root_movie_download_failed_message(false);
+                    .display_root_movie_download_failed_message(false, error.error.to_string());
                 error.error
             })?;
             let url = response.url().into_owned();
-            let body = response.body().await.inspect_err(|_error| {
+            let body = response.body().await.inspect_err(|error| {
                 player
                     .lock()
                     .unwrap()
                     .ui()
-                    .display_root_movie_download_failed_message(true);
+                    .display_root_movie_download_failed_message(true, error.to_string());
             })?;
 
             // The spoofed root movie URL takes precedence over the actual URL.
@@ -1090,12 +1090,12 @@ impl<'gc> Loader<'gc> {
                 .unwrap_or(swf_url);
 
             let mut movie =
-                SwfMovie::from_data(&body, spoofed_or_swf_url, None).inspect_err(|_error| {
+                SwfMovie::from_data(&body, spoofed_or_swf_url, None).inspect_err(|error| {
                     player
                         .lock()
                         .unwrap()
                         .ui()
-                        .display_root_movie_download_failed_message(true);
+                        .display_root_movie_download_failed_message(true, error.to_string());
                 })?;
             on_metadata(movie.header());
             movie.append_parameters(parameters);
@@ -1290,10 +1290,12 @@ impl<'gc> Loader<'gc> {
             mc.replace_with_movie(uc, None, false, None);
         }
 
+        let loader_url = Some(uc.swf.url().to_string());
+
         if replacing_root_movie {
             ContentType::sniff(&bytes).expect(ContentType::Swf)?;
 
-            let movie = SwfMovie::from_data(&bytes, "file:///".into(), None)?;
+            let movie = SwfMovie::from_data(&bytes, "file:///".into(), loader_url)?;
             avm2_stub_method_context!(
                 uc,
                 "flash.display.Loader",
@@ -1304,7 +1306,7 @@ impl<'gc> Loader<'gc> {
             return Ok(());
         }
 
-        Loader::movie_loader_data(handle, uc, &bytes, "file:///".into(), 0, false, None)
+        Loader::movie_loader_data(handle, uc, &bytes, "file:///".into(), 0, false, loader_url)
     }
 
     fn form_loader(
@@ -2076,6 +2078,7 @@ impl<'gc> Loader<'gc> {
             loader_info.set_content_type(sniffed_type);
             let fake_movie = Arc::new(SwfMovie::fake_with_compressed_len(
                 activation.context.swf.version(),
+                loader_url.clone(),
                 data.len(),
             ));
 
@@ -2213,6 +2216,7 @@ impl<'gc> Loader<'gc> {
                 if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
                     let fake_movie = Arc::new(SwfMovie::fake_with_compressed_len(
                         activation.context.swf.version(),
+                        loader_url.clone(),
                         data.len(),
                     ));
 
@@ -2227,6 +2231,7 @@ impl<'gc> Loader<'gc> {
                 if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
                     let fake_movie = Arc::new(SwfMovie::fake_with_compressed_data(
                         activation.context.swf.version(),
+                        loader_url,
                         data.to_vec(),
                     ));
 
@@ -2288,6 +2293,7 @@ impl<'gc> Loader<'gc> {
                     MovieLoaderVMData::Avm2 { loader_info, .. } => {
                         let fake_movie = Arc::new(SwfMovie::fake_with_compressed_len(
                             activation.context.swf.version(),
+                            loader_url,
                             data.len(),
                         ));
 
@@ -2482,7 +2488,7 @@ impl<'gc> Loader<'gc> {
                 mc.replace_at_depth(uc, dobj, 1);
 
                 // This sets the MovieClip image state correctly.
-                mc.set_current_frame(uc.gc(), 1);
+                mc.set_current_frame(1);
                 mc.set_cur_preload_frame(2);
             }
         }
@@ -2626,7 +2632,7 @@ impl<'gc> Loader<'gc> {
                     let current_movie = mc.movie();
                     let current_version = current_movie.version();
                     let current_url = current_movie.url();
-                    let mut initial_loading_movie = SwfMovie::empty(current_version);
+                    let mut initial_loading_movie = SwfMovie::empty(current_version, None);
                     initial_loading_movie.set_url(current_url.to_string());
 
                     mc.replace_with_movie(uc, Some(Arc::new(initial_loading_movie)), true, None);

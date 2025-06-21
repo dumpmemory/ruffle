@@ -2044,24 +2044,23 @@ export class InnerPlayer {
         }
         this.hideSplashScreen();
 
-        const div = document.createElement("div");
-        div.id = "message-overlay";
-        const innerDiv = document.createElement("div");
-        innerDiv.className = "message";
-        innerDiv.appendChild(textAsParagraphs("message-cant-embed"));
-
-        const buttonDiv = document.createElement("div");
-        const link = document.createElement("a");
-        link.innerText = text("open-in-new-tab");
-        link.onclick = () => openInNewTab(url);
-        buttonDiv.appendChild(link);
-
-        innerDiv.appendChild(buttonDiv);
-        div.appendChild(innerDiv);
-        this.container.prepend(div);
+        const newTabMessage = (
+            <div>
+                {textAsParagraphs("message-cant-embed")}
+                <div>
+                    <a href="#" onClick={() => openInNewTab(url)}>
+                        {text("open-in-new-tab")}
+                    </a>
+                </div>
+            </div>
+        ) as HTMLDivElement;
+        this.displayMessageOrElement(newTabMessage, true);
     }
 
-    protected displayRootMovieDownloadFailedMessage(invalidSwf: boolean): void {
+    protected displayRootMovieDownloadFailedMessage(
+        invalidSwf: boolean,
+        fetchError: string,
+    ): void {
         const openInNewTab = this.loadedConfig?.openInNewTab;
         if (
             openInNewTab &&
@@ -2070,10 +2069,53 @@ export class InnerPlayer {
         ) {
             this.addOpenInNewTabMessage(openInNewTab, this.swfUrl);
         } else {
+            const fetchStatusNotOk = fetchError.includes(
+                "HTTP Status is not OK:",
+            );
             const error = invalidSwf
                 ? new InvalidSwfError(this.swfUrl)
-                : new LoadSwfError(this.swfUrl);
+                : new LoadSwfError(this.swfUrl, fetchStatusNotOk);
             this.panic(error);
+        }
+    }
+
+    /**
+     * Show a dismissible message in front of the player.
+     *
+     * @param message The message shown to the user, which can be a string or element.
+     * @param omitContinueButton If true, the continue button will not be shown.
+     */
+    private displayMessageOrElement(
+        message: string | HTMLDivElement,
+        omitContinueButton?: boolean,
+    ): void {
+        const messageContent =
+            message instanceof HTMLDivElement ? message : <p>{message}</p>;
+
+        const continueButton = !omitContinueButton ? (
+            <div>
+                <button id="continue-btn">{text("continue")}</button>
+            </div>
+        ) : null;
+
+        const messageOverlay = (
+            <div id="message-overlay">
+                <div class="message">
+                    {messageContent}
+                    {continueButton}
+                </div>
+            </div>
+        );
+
+        this.container.prepend(messageOverlay);
+
+        if (!omitContinueButton) {
+            const continueBtn = this.container.querySelector(
+                "#continue-btn",
+            ) as HTMLButtonElement;
+            continueBtn.onclick = () => {
+                messageOverlay.parentNode!.removeChild(messageOverlay);
+            };
         }
     }
 
@@ -2083,26 +2125,30 @@ export class InnerPlayer {
      * @param message The message shown to the user.
      */
     public displayMessage(message: string): void {
-        const div = document.createElement("div");
-        div.id = "message-overlay";
-        const messageDiv = document.createElement("div");
-        messageDiv.className = "message";
-        const messageP = document.createElement("p");
-        messageP.textContent = message;
-        messageDiv.appendChild(messageP);
-        const buttonDiv = document.createElement("div");
-        const continueButton = document.createElement("button");
-        continueButton.id = "continue-btn";
-        continueButton.textContent = text("continue");
-        buttonDiv.appendChild(continueButton);
-        messageDiv.appendChild(buttonDiv);
-        div.appendChild(messageDiv);
-        this.container.prepend(div);
-        (
-            this.container.querySelector("#continue-btn") as HTMLButtonElement
-        ).onclick = () => {
-            div.parentNode!.removeChild(div);
-        };
+        this.displayMessageOrElement(message);
+    }
+
+    /**
+     * Inform the user that the browser restored the file from the back/forward cache.
+     */
+    protected displayRestoredFromBfcacheMessage(): void {
+        // Do not display the message if another one is already shown.
+        if (this.container.querySelector("#message-overlay") !== null) {
+            return;
+        }
+        const message = textAsParagraphs("message-restored-from-bfcache");
+        this.displayMessageOrElement(message);
+
+        // Remove the message element if it doesn't fit in the container, to avoid potential blocking situations.
+        const messageOverlay = this.container.querySelector(
+            "#message-overlay",
+        )! as HTMLElement;
+        if (
+            messageOverlay.scrollWidth > messageOverlay.offsetWidth ||
+            messageOverlay.scrollHeight > messageOverlay.offsetHeight
+        ) {
+            messageOverlay.parentNode!.removeChild(messageOverlay);
+        }
     }
 
     /**
@@ -2113,13 +2159,14 @@ export class InnerPlayer {
     protected displayUnsupportedVideo(url: string): void {
         const videoHolder = this.videoModal.querySelector("#video-holder");
         if (videoHolder) {
-            const video = document.createElement("video");
-            video.addEventListener("contextmenu", (event) =>
-                event.stopPropagation(),
+            const video = (
+                <video
+                    src={url}
+                    autoplay={true}
+                    controls={true}
+                    onContextMenu={(event) => event.stopPropagation()}
+                />
             );
-            video.src = url;
-            video.autoplay = true;
-            video.controls = true;
             videoHolder.textContent = "";
             videoHolder.appendChild(video);
             this.videoModal.classList.remove("hidden");

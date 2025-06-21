@@ -231,6 +231,10 @@ pub struct UpdateContext<'gc> {
     pub post_frame_callbacks: &'gc mut Vec<PostFrameCallback<'gc>>,
 
     pub notification_sender: Option<&'gc Sender<PlayerNotification>>,
+
+    // Movie clips whose frame scripts were registered during frame script phase
+    // requires a seperate clean-up pass when running frame-scripts instead of executing them in place
+    pub frame_script_cleanup_queue: VecDeque<MovieClip<'gc>>,
 }
 
 impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
@@ -334,8 +338,8 @@ impl<'gc> UpdateContext<'gc> {
 
     /// Change the root movie.
     ///
-    /// This should only be called once, as it makes no attempt at removing
-    /// previous stage contents. If you need to load a new root movie, you
+    /// This should only be called once, as it makes no attempt at proper clean-up
+    /// of previous stage contents. If you need to load a new root movie, you
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovie) {
         if !self.forced_frame_rate {
@@ -397,6 +401,8 @@ impl<'gc> UpdateContext<'gc> {
         drop(activation);
 
         root.set_depth(0);
+        root.set_perspective_projection(self.gc(), None); // Set default PerspectiveProjection
+
         let flashvars = if !self.swf.parameters().is_empty() {
             let object = Avm1Object::new(&self.strings, None);
             for (key, value) in self.swf.parameters().iter() {
@@ -469,6 +475,10 @@ impl<'gc> UpdateContext<'gc> {
 
     pub fn avm_trace(&self, message: &str) {
         self.log.avm_trace(&message.replace('\r', "\n"));
+    }
+
+    pub fn avm_warning(&self, message: &str) {
+        self.log.avm_warning(message);
     }
 }
 

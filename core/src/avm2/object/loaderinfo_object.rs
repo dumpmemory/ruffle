@@ -272,7 +272,7 @@ impl<'gc> LoaderInfoObject<'gc> {
                     root.as_movie_clip()
                         .map(|mc| mc.loaded_bytes() as i32 >= mc.total_bytes())
                         .unwrap_or(true),
-                    movie.loader_url().is_some(),
+                    movie.url() != "file:///",
                 ),
                 _ => (false, false),
             };
@@ -350,7 +350,8 @@ impl<'gc> LoaderInfoObject<'gc> {
 
     pub fn unload(&self, activation: &mut Activation<'_, 'gc>) {
         // Reset properties
-        let empty_swf = Arc::new(SwfMovie::empty(activation.context.swf.version()));
+        let movie = &activation.context.swf;
+        let empty_swf = Arc::new(SwfMovie::empty(movie.version(), Some(movie.url().into())));
         let loader_stream = LoaderStream::NotYetLoaded(empty_swf, None, false);
         self.set_loader_stream(loader_stream, activation.gc());
         self.set_errored(false);

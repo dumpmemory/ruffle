@@ -26,6 +26,7 @@ use gc_arena::{Collect, Gc, Lock, Mutation, RefLock};
 use ruffle_macros::istr;
 use ruffle_render::backend::ViewportDimensions;
 use ruffle_render::commands::CommandHandler;
+use ruffle_render::perspective_projection::PerspectiveProjection;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -151,7 +152,7 @@ impl<'gc> Stage<'gc> {
             gc_context,
             StageData {
                 base: Default::default(),
-                child: RefLock::new(ChildContainer::new(movie.clone())),
+                child: RefLock::new(ChildContainer::new(&movie)),
                 background_color: Cell::new(None),
                 letterbox: Cell::new(Letterbox::Fullscreen),
                 // This is updated when we set the root movie
@@ -184,6 +185,7 @@ impl<'gc> Stage<'gc> {
             },
         ));
         stage.set_is_root(true);
+        stage.set_perspective_projection(gc_context, None); // Set default PerspectiveProjection
         stage
     }
 
@@ -227,12 +229,9 @@ impl<'gc> Stage<'gc> {
     }
 
     pub fn set_movie(self, gc_context: &Mutation<'gc>, movie: Arc<SwfMovie>) {
-        self.0.movie.replace(movie.clone());
-
         // Stage is the only DO that has a fake movie set and then gets the real movie set.
-        unlock!(Gc::write(gc_context, self.0), StageData, child)
-            .borrow_mut()
-            .set_movie(movie);
+        *self.raw_container_mut(gc_context) = ChildContainer::new(&movie);
+        self.0.movie.replace(movie.clone());
     }
 
     pub fn set_loader_info(self, gc_context: &Mutation<'gc>, loader_info: Avm2Object<'gc>) {
@@ -828,6 +827,12 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
         context.transform_stack.push(&Transform {
             matrix: self.0.viewport_matrix.get(),
             color_transform: Default::default(),
+            // TODO: Verify perspective_projection when its rendering is implemented.
+            perspective_projection: self
+                .as_displayobject()
+                .base()
+                .perspective_projection()
+                .copied(),
         });
 
         // All of our Stage3D instances get rendered *underneath* the main stage.
@@ -875,6 +880,27 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
             .get()
             .expect("Attempted to access Stage::object2 before initialization")
             .into()
+    }
+
+    fn set_perspective_projection(
+        &self,
+        gc_context: &Mutation<'gc>,
+        mut perspective_projection: Option<PerspectiveProjection>,
+    ) {
+        if perspective_projection.is_none() {
+            // `stage` doesn't allow null PerspectiveProjection.
+            perspective_projection = Some(Default::default());
+        }
+        if self
+            .base_mut(gc_context)
+            .set_perspective_projection(perspective_projection)
+        {
+            if let Some(parent) = self.parent() {
+                // Self-transform changes are automatically handled,
+                // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
+                parent.invalidate_cached_bitmap(gc_context);
+            }
+        }
     }
 
     fn loader_info(&self) -> Option<Avm2Object<'gc>> {

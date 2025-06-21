@@ -10,9 +10,6 @@ mod display_object;
 pub use display_object::{StageAlign, StageDisplayState, StageScaleMode};
 
 #[macro_use]
-extern crate smallvec;
-
-#[macro_use]
 extern crate num_derive;
 
 #[macro_use]
@@ -64,7 +61,7 @@ pub mod stub;
 
 pub use context_menu::ContextMenuItem;
 pub use events::PlayerEvent;
-pub use font::DefaultFont;
+pub use font::{DefaultFont, FontQuery};
 pub use indexmap;
 pub use loader::LoadBehavior;
 pub use player::{Player, PlayerBuilder, PlayerMode, PlayerRuntime, StaticCallstack};

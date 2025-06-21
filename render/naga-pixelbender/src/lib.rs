@@ -239,7 +239,7 @@ impl ShaderBuilder<'_> {
                 location: 0,
                 interpolation: Some(naga::Interpolation::Perspective),
                 sampling: Some(naga::Sampling::Center),
-                second_blend_source: false,
+                blend_src: None,
             }),
         });
 
@@ -249,7 +249,7 @@ impl ShaderBuilder<'_> {
                 location: 0,
                 interpolation: None,
                 sampling: None,
-                second_blend_source: false,
+                blend_src: None,
             }),
         });
 
@@ -1031,6 +1031,16 @@ impl ShaderBuilder<'_> {
                             let right = self.load_src_register(&dst)?;
                             self.evaluate_expr(Expression::Math {
                                 fun: MathFunction::Min,
+                                arg: src,
+                                arg1: Some(right),
+                                arg2: None,
+                                arg3: None,
+                            })
+                        }
+                        Opcode::Step => {
+                            let right = self.load_src_register(&dst)?;
+                            self.evaluate_expr(Expression::Math {
+                                fun: MathFunction::Step,
                                 arg: src,
                                 arg1: Some(right),
                                 arg2: None,

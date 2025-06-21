@@ -8,7 +8,7 @@ use crate::avm2::error::{
     make_error_1065, make_error_1127, make_error_1506, make_null_or_undefined_error, type_error,
 };
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::method::{Method, ResolvedParamConfig};
+use crate::avm2::method::{Method, NativeMethodImpl, ResolvedParamConfig};
 use crate::avm2::object::{
     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
     XmlListObject,
@@ -698,6 +698,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     num_args,
                     push_return_value,
                 } => self.op_call_method(*index, *num_args, *push_return_value),
+                Op::CallNative {
+                    method,
+                    num_args,
+                    push_return_value,
+                } => self.op_call_native(*method, *num_args, *push_return_value),
                 Op::CallProperty {
                     multiname,
                     num_args,
@@ -1089,6 +1094,29 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(())
     }
 
+    fn op_call_native(
+        &mut self,
+        method: NativeMethodImpl,
+        num_args: u32,
+        push_return_value: bool,
+    ) -> Result<(), Error<'gc>> {
+        let mut args_buf = [Value::Undefined; 2];
+        let args = &mut args_buf[..num_args as usize];
+        for arg in args.iter_mut().rev() {
+            *arg = self.pop_stack();
+        }
+
+        let receiver = self.pop_stack().null_check(self, None)?;
+
+        let value = method(self, receiver, args).expect("FastCall methods should not return Err");
+
+        if push_return_value {
+            self.push_stack(value);
+        }
+
+        Ok(())
+    }
+
     fn op_call_property(
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
@@ -1223,8 +1251,6 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         // (fast) side path for dictionary/array-likes
-        // NOTE: FP behaves differently here when the public namespace isn't
-        // included in the multiname's namespace set
         if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
             // `MultinameL` is the only form of multiname that allows fast-path
             // or alternate-path lookups based on the local name *value*,
@@ -1236,12 +1262,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             if let Value::Object(object) = object_value {
                 match name_value {
                     Value::Integer(name_int) if name_int >= 0 => {
-                        if let Some(value) = object.get_index_property(name_int as usize) {
-                            let _ = self.pop_stack();
-                            let _ = self.pop_stack();
-                            self.push_stack(value);
+                        // Note that this path doesn't activate when the
+                        // public namespace isn't included in the multiname's
+                        // namespace set
+                        if multiname.contains_public_namespace() {
+                            if let Some(value) = object.get_index_property(name_int as usize) {
+                                let _ = self.pop_stack();
+                                let _ = self.pop_stack();
+                                self.push_stack(value);
 
-                            return Ok(());
+                                return Ok(());
+                            }
                         }
                     }
                     Value::Object(name_object) => {
@@ -1280,9 +1311,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(());
         }
 
-        // side path for dictionary/arrays (TODO)
-        // NOTE: FP behaves differently here when the public namespace isn't
-        // included in the multiname's namespace set
+        // side path for dictionary/arrays
         if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
             // `MultinameL` is the only form of multiname that allows fast-path
             // or alternate-path lookups based on the local name *value*,
@@ -1294,12 +1323,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             if let Value::Object(object) = object_value {
                 match name_value {
                     Value::Integer(name_int) if name_int >= 0 => {
-                        if let Some(mut array) = object.as_array_storage_mut(self.gc()) {
-                            let _ = self.pop_stack();
-                            let _ = self.pop_stack();
-                            array.set(name_int as usize, value);
+                        // Note that this path doesn't activate when the
+                        // public namespace isn't included in the multiname's
+                        // namespace set
+                        if multiname.contains_public_namespace() {
+                            if let Some(mut array) = object.as_array_storage_mut(self.gc()) {
+                                let _ = self.pop_stack();
+                                let _ = self.pop_stack();
+                                array.set(name_int as usize, value);
 
-                            return Ok(());
+                                return Ok(());
+                            } else if let Some(vector) = object.as_vector_object() {
+                                let _ = self.pop_stack();
+                                let _ = self.pop_stack();
+
+                                return vector.set_index_property(self, name_int as usize, value);
+                            }
                         }
                     }
                     Value::Object(name_object) => {

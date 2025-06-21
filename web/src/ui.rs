@@ -6,6 +6,7 @@ use ruffle_core::backend::ui::{
 use ruffle_core::backend::ui::{
     FontDefinition, FullscreenError, LanguageIdentifier, MouseCursor, UiBackend, US_ENGLISH,
 };
+use ruffle_core::FontQuery;
 use ruffle_web_common::JsResult;
 use std::borrow::Cow;
 use url::Url;
@@ -289,9 +290,9 @@ impl UiBackend for WebUiBackend {
         }
     }
 
-    fn display_root_movie_download_failed_message(&self, invalid_swf: bool) {
+    fn display_root_movie_download_failed_message(&self, invalid_swf: bool, fetch_error: String) {
         self.js_player
-            .display_root_movie_download_failed_message(invalid_swf)
+            .display_root_movie_download_failed_message(invalid_swf, fetch_error)
     }
 
     fn message(&self, message: &str) {
@@ -314,15 +315,17 @@ impl UiBackend for WebUiBackend {
         self.js_player.display_unsupported_video(url.as_str());
     }
 
-    fn load_device_font(
-        &self,
-        _name: &str,
-        _is_bold: bool,
-        _is_italic: bool,
-        _register: &mut dyn FnMut(FontDefinition),
-    ) {
+    fn load_device_font(&self, _query: &FontQuery, _register: &mut dyn FnMut(FontDefinition)) {
         // Because fonts must be loaded instantly (no async),
         // we actually just provide them all upfront at time of Player creation.
+    }
+
+    fn sort_device_fonts(
+        &self,
+        _query: &FontQuery,
+        _register: &mut dyn FnMut(FontDefinition),
+    ) -> Vec<FontQuery> {
+        Vec::new()
     }
 
     fn display_file_open_dialog(&mut self, filters: Vec<FileFilter>) -> Option<DialogResultFuture> {

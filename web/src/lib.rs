@@ -38,9 +38,10 @@ use url::Url;
 use wasm_bindgen::convert::FromWasmAbi;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    AddEventListenerOptions, ClipboardEvent, Element, Event, EventTarget, FocusEvent,
+    AddEventListenerOptions, ClipboardEvent, Element, EventTarget, FocusEvent,
     Gamepad as WebGamepad, GamepadButton as WebGamepadButton, HtmlCanvasElement, HtmlElement,
-    KeyboardEvent, Node, PointerEvent, ShadowRoot, WebGlContextEvent, WheelEvent, Window,
+    KeyboardEvent, Node, PageTransitionEvent, PointerEvent, ShadowRoot, WebGlContextEvent,
+    WheelEvent, Window,
 };
 
 static RUFFLE_GLOBAL_PANIC: Once = Once::new();
@@ -134,7 +135,8 @@ struct RuffleInstance {
     key_down_callback: Option<JsCallback<KeyboardEvent>>,
     key_up_callback: Option<JsCallback<KeyboardEvent>>,
     paste_callback: Option<JsCallback<ClipboardEvent>>,
-    unload_callback: Option<JsCallback<Event>>,
+    pageshow_callback: Option<JsCallback<PageTransitionEvent>>,
+    pagehide_callback: Option<JsCallback<PageTransitionEvent>>,
     focusin_callback: Option<JsCallback<FocusEvent>>,
     focusout_callback: Option<JsCallback<FocusEvent>>,
     focus_on_press_callback: Option<JsCallback<PointerEvent>>,
@@ -164,7 +166,14 @@ extern "C" {
     fn panic(this: &JavascriptPlayer, error: &JsError);
 
     #[wasm_bindgen(method, js_name = "displayRootMovieDownloadFailedMessage")]
-    fn display_root_movie_download_failed_message(this: &JavascriptPlayer, invalid_swf: bool);
+    fn display_root_movie_download_failed_message(
+        this: &JavascriptPlayer,
+        invalid_swf: bool,
+        fetch_error: String,
+    );
+
+    #[wasm_bindgen(method, js_name = "displayRestoredFromBfcacheMessage")]
+    fn display_restored_from_bfcache_message(this: &JavascriptPlayer);
 
     #[wasm_bindgen(method, js_name = "displayMessage")]
     fn display_message(this: &JavascriptPlayer, message: &str);
@@ -223,6 +232,13 @@ struct MovieMetadata {
     uncompressed_len: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ScrollingBehavior {
+    Always,
+    Never,
+    Smart,
+}
+
 #[wasm_bindgen]
 impl RuffleHandle {
     /// Stream an arbitrary movie file from (presumably) the Internet.
@@ -268,7 +284,7 @@ impl RuffleHandle {
             SwfMovie::from_data(&swf_data.to_vec(), url.to_string(), None).map_err(|e| {
                 let _ = self.with_core_mut(|core| {
                     core.ui_mut()
-                        .display_root_movie_download_failed_message(true);
+                        .display_root_movie_download_failed_message(true, e.to_string());
                 });
                 format!("Error loading movie: {e}")
             })?;
@@ -503,7 +519,8 @@ impl RuffleHandle {
             key_down_callback: None,
             key_up_callback: None,
             paste_callback: None,
-            unload_callback: None,
+            pageshow_callback: None,
+            pagehide_callback: None,
             focusin_callback: None,
             focusout_callback: None,
             focus_on_press_callback: None,
@@ -678,9 +695,26 @@ impl RuffleHandle {
                             _ => return,
                         };
                         let _ = instance.with_core_mut(|core| {
-                            core.handle_event(PlayerEvent::MouseWheel { delta });
-                            if core.should_prevent_scrolling() {
-                                js_event.prevent_default();
+                            let scroll_handled =
+                                core.handle_event(PlayerEvent::MouseWheel { delta });
+                            match config.scrolling_behavior {
+                                ScrollingBehavior::Always => {
+                                    // Do not prevent scrolling
+                                }
+                                ScrollingBehavior::Never => {
+                                    // Always prevent scrolling
+                                    js_event.prevent_default();
+                                }
+                                ScrollingBehavior::Smart => {
+                                    if scroll_handled {
+                                        // AVM2 logic
+                                        js_event.prevent_default();
+                                    }
+                                    if core.should_prevent_scrolling() {
+                                        // AVM1 logic
+                                        js_event.prevent_default();
+                                    }
+                                }
                             }
                         });
                     });
@@ -774,6 +808,7 @@ impl RuffleHandle {
             ));
 
             // Create webglcontextlost handler.
+            let js_player_callback = js_player.clone();
             instance.webglcontextlost_callback = Some(JsCallback::register(
                 &player.canvas,
                 "webglcontextlost",
@@ -782,18 +817,36 @@ impl RuffleHandle {
                     INSTANCES.with(|instances| {
                         if instances.borrow().len() >= 8 {
                             let _ = ruffle.remove_instance();
-                            js_player.reload_with_canvas_renderer();
+                            js_player_callback.reload_with_canvas_renderer();
                         }
                     });
                 },
             ));
 
-            instance.unload_callback =
-                Some(JsCallback::register(&window, "unload", false, move |_| {
+            // Create pageshow event handler.
+            let js_player_callback = js_player.clone();
+            instance.pageshow_callback = Some(JsCallback::register(
+                &window,
+                "pageshow",
+                false,
+                move |js_event: PageTransitionEvent| {
+                    if js_event.persisted() {
+                        js_player_callback.display_restored_from_bfcache_message();
+                    }
+                },
+            ));
+
+            // Create pagehide event handler.
+            instance.pagehide_callback = Some(JsCallback::register(
+                &window,
+                "pagehide",
+                false,
+                move |_js_event: PageTransitionEvent| {
                     let _ = ruffle.with_core_mut(|core| {
                         core.flush_shared_objects();
                     });
-                }));
+                },
+            ));
         })?;
 
         // Set initial timestamp and do initial tick to start animation loop.
